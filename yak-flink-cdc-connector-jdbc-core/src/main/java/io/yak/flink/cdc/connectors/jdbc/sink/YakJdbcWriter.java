@@ -1,6 +1,7 @@
 package io.yak.flink.cdc.connectors.jdbc.sink;
 
 import io.yak.flink.cdc.connectors.jdbc.JdbcSinkConfig;
+import io.yak.flink.cdc.connectors.jdbc.ReplaySafetyMode;
 import io.yak.flink.cdc.connectors.jdbc.dialect.JdbcDialect;
 import io.yak.flink.cdc.connectors.jdbc.dialect.JdbcDialectRegistry;
 import io.yak.flink.cdc.connectors.jdbc.runtime.JdbcBatchBuffer;
@@ -24,6 +25,7 @@ import org.apache.flink.cdc.common.schema.Schema;
 import org.apache.flink.cdc.common.utils.SchemaUtils;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -72,7 +74,7 @@ public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWri
             // SinkWriter.flush(false). Keep this defensive flush as well so direct/runtime variants
             // cannot carry old-schema buffered rows across a schema boundary.
             flush(false);
-            batchExecutor.invalidateStatements();
+            batchExecutor.invalidateStatements(event.tableId());
             applySchemaEvent((SchemaChangeEvent) event);
             return;
         }
@@ -114,8 +116,13 @@ public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWri
     private void bufferDataChange(DataChangeEvent event, Schema schema) throws IOException {
         OperationType operation = event.op();
 
+        if (schema.primaryKeys().isEmpty()) {
+            bufferNoPrimaryKeyChange(event, schema);
+            return;
+        }
+
         if (operation == OperationType.DELETE) {
-            bufferDelete(event, schema);
+            bufferDelete(event.tableId(), event.before(), schema);
             return;
         }
 
@@ -125,51 +132,110 @@ public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWri
             throw new IOException("Unsupported operation: " + operation);
         }
 
-        if (schema.primaryKeys().isEmpty() && operation != OperationType.INSERT) {
-            throw new IOException(
-                    operation
-                            + " requires a primary key for replay-safe JDBC CDC writes to "
-                            + event.tableId());
+        RecordData after = event.after();
+        if (after == null) {
+            throw new IOException(operation + " event has no after image for " + event.tableId());
         }
 
-        String sql =
-                schema.primaryKeys().isEmpty()
-                        ? dialect.buildInsertStatement(event.tableId(), schema)
-                        : dialect.buildUpsertStatement(event.tableId(), schema);
-        List<Object> values = JdbcValueConverter.toJdbcValues(event.after(), schema);
-        buffer(sql, values);
+        // An UPDATE may change a primary-key value. A plain upsert of the after image would leave
+        // the old primary-key row behind. Delete the old key first; delete + upsert are both
+        // idempotent and are committed in the same ordered batch transaction.
+        if (operation == OperationType.UPDATE) {
+            RecordData before = event.before();
+            if (before == null) {
+                throw new IOException(
+                        "UPDATE requires a before image to verify primary-key replay safety for "
+                                + event.tableId());
+            }
+            List<Object> oldKey = extractPrimaryKeyValues(before, schema, event.tableId());
+            List<Object> newKey = extractPrimaryKeyValues(after, schema, event.tableId());
+            if (!oldKey.equals(newKey)) {
+                buffer(
+                        event.tableId(),
+                        dialect.buildDeleteStatement(event.tableId(), schema),
+                        oldKey);
+            }
+        } else {
+            // Validate key values before buffering INSERT/REPLACE as well.
+            extractPrimaryKeyValues(after, schema, event.tableId());
+        }
+
+        String sql = dialect.buildUpsertStatement(event.tableId(), schema);
+        List<Object> values = JdbcValueConverter.toJdbcValues(after, schema);
+        buffer(event.tableId(), sql, values);
     }
 
-    private void bufferDelete(DataChangeEvent event, Schema schema) throws IOException {
-        if (schema.primaryKeys().isEmpty()) {
+    private void bufferNoPrimaryKeyChange(DataChangeEvent event, Schema schema) throws IOException {
+        if (event.op() != OperationType.INSERT) {
             throw new IOException(
-                    "DELETE requires a primary key for table " + event.tableId().identifier());
+                    event.op()
+                            + " requires a primary key for replay-safe JDBC CDC writes to "
+                            + event.tableId()
+                            + ". No replay-safety mode permits no-primary-key UPDATE/REPLACE/DELETE.");
         }
 
-        RecordData before = event.before();
-        List<Object> allValues = JdbcValueConverter.toJdbcValues(before, schema);
+        if (config.getReplaySafetyMode() != ReplaySafetyMode.ALLOW_APPEND_ONLY) {
+            throw new IOException(
+                    "INSERT into no-primary-key table "
+                            + event.tableId()
+                            + " is rejected by replay-safety=strict. At-least-once replay after an "
+                            + "ambiguous commit can duplicate append-only rows. Set "
+                            + "replay-safety=allow-append-only only when duplicate rows are an "
+                            + "accepted application-level risk.");
+        }
+
+        RecordData after = event.after();
+        if (after == null) {
+            throw new IOException("INSERT event has no after image for " + event.tableId());
+        }
+        buffer(
+                event.tableId(),
+                dialect.buildInsertStatement(event.tableId(), schema),
+                JdbcValueConverter.toJdbcValues(after, schema));
+    }
+
+    private void bufferDelete(TableId tableId, RecordData before, Schema schema) throws IOException {
+        if (before == null) {
+            throw new IOException("DELETE event has no before image for " + tableId);
+        }
+        List<Object> keyValues = extractPrimaryKeyValues(before, schema, tableId);
+        buffer(tableId, dialect.buildDeleteStatement(tableId, schema), keyValues);
+    }
+
+    private static List<Object> extractPrimaryKeyValues(
+            RecordData record, Schema schema, TableId tableId) throws IOException {
+        List<Object> allValues = JdbcValueConverter.toJdbcValues(record, schema);
         List<String> names = schema.getColumnNames();
-        java.util.ArrayList<Object> keyValues = new java.util.ArrayList<>();
+        List<Object> keyValues = new ArrayList<>(schema.primaryKeys().size());
         for (String primaryKey : schema.primaryKeys()) {
             int index = names.indexOf(primaryKey);
             if (index < 0) {
                 throw new IOException("Primary key column not found in schema: " + primaryKey);
             }
-            keyValues.add(allValues.get(index));
+            Object keyValue = allValues.get(index);
+            if (keyValue == null) {
+                throw new IOException(
+                        "Primary key column "
+                                + primaryKey
+                                + " is null in CDC record for "
+                                + tableId
+                                + "; replay-safe DML requires non-null primary keys");
+            }
+            keyValues.add(keyValue);
         }
-        buffer(dialect.buildDeleteStatement(event.tableId(), schema), keyValues);
+        return keyValues;
     }
 
-    private void buffer(String sql, List<Object> values) throws IOException {
+    private void buffer(TableId tableId, String sql, List<Object> values) throws IOException {
         // Flush the existing batch before retaining a record that would cross the configured memory
         // boundary. A single record may itself be larger than max-batch-bytes; in that case it is
         // accepted as the only record and flushed immediately below.
         if (!batchBuffer.isEmpty()
-                && batchBuffer.wouldExceed(config.getMaxBatchBytes(), sql, values)) {
+                && batchBuffer.wouldExceed(config.getMaxBatchBytes(), tableId, sql, values)) {
             flush(false);
         }
 
-        batchBuffer.add(sql, values);
+        batchBuffer.add(tableId, sql, values);
         scheduleFlushIfNeeded();
 
         if (batchBuffer.size() >= config.getBatchSize()
@@ -214,8 +280,6 @@ public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWri
     }
 
     private void onProcessingTime(long timestamp) throws Exception {
-        // The callback is the owner of this timer now; clear the reference before flushing so the
-        // flush path does not try to cancel the currently executing future.
         flushTimer = null;
         if (closed) {
             return;
