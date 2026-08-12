@@ -1,6 +1,7 @@
 package io.yak.flink.cdc.connectors.jdbc.postgres;
 
 import io.yak.flink.cdc.connectors.jdbc.dialect.AbstractJdbcDialect;
+import io.yak.flink.cdc.connectors.jdbc.dialect.JdbcColumnMetadata;
 
 import org.apache.flink.cdc.common.event.TableId;
 import org.apache.flink.cdc.common.schema.Column;
@@ -8,7 +9,9 @@ import org.apache.flink.cdc.common.schema.Schema;
 import org.apache.flink.cdc.common.types.DataType;
 import org.apache.flink.cdc.common.types.DataTypeChecks;
 
+import java.sql.Types;
 import java.util.List;
+import java.util.Locale;
 import java.util.stream.Collectors;
 
 public final class PostgresJdbcDialect extends AbstractJdbcDialect {
@@ -66,6 +69,69 @@ public final class PostgresJdbcDialect extends AbstractJdbcDialect {
             default:
                 throw new UnsupportedOperationException(
                         "Unsupported PostgreSQL target type in MVP: " + type.asSummaryString());
+        }
+    }
+
+    @Override
+    public boolean isColumnTypeCompatible(DataType expectedType, JdbcColumnMetadata actualColumn) {
+        if (expectedType.isNullable() != actualColumn.isNullable()) {
+            return false;
+        }
+
+        int jdbcType = actualColumn.getJdbcType();
+        String typeName = actualColumn.getTypeName().toLowerCase(Locale.ROOT);
+        switch (expectedType.getTypeRoot()) {
+            case BOOLEAN:
+                return jdbcType == Types.BOOLEAN || jdbcType == Types.BIT;
+            case TINYINT:
+            case SMALLINT:
+                return jdbcType == Types.SMALLINT;
+            case INTEGER:
+                return jdbcType == Types.INTEGER;
+            case BIGINT:
+                return jdbcType == Types.BIGINT;
+            case FLOAT:
+                return jdbcType == Types.REAL || jdbcType == Types.FLOAT;
+            case DOUBLE:
+                return jdbcType == Types.DOUBLE;
+            case DECIMAL:
+                return (jdbcType == Types.DECIMAL || jdbcType == Types.NUMERIC)
+                        && actualColumn.getColumnSize() == DataTypeChecks.getPrecision(expectedType)
+                        && actualColumn.getDecimalDigits() == DataTypeChecks.getScale(expectedType);
+            case CHAR:
+                return jdbcType == Types.CHAR
+                        && actualColumn.getColumnSize() == DataTypeChecks.getLength(expectedType);
+            case VARCHAR:
+                int expectedLength = DataTypeChecks.getLength(expectedType);
+                if (expectedLength >= 10_485_760) {
+                    return typeName.equals("text")
+                            || jdbcType == Types.LONGVARCHAR
+                            || (jdbcType == Types.VARCHAR
+                                    && actualColumn.getColumnSize() > 10_485_760);
+                }
+                return jdbcType == Types.VARCHAR
+                        && actualColumn.getColumnSize() == expectedLength;
+            case BINARY:
+            case VARBINARY:
+                return typeName.equals("bytea")
+                        || jdbcType == Types.BINARY
+                        || jdbcType == Types.VARBINARY
+                        || jdbcType == Types.LONGVARBINARY;
+            case DATE:
+                return jdbcType == Types.DATE;
+            case TIME_WITHOUT_TIME_ZONE:
+                return jdbcType == Types.TIME || jdbcType == Types.TIME_WITH_TIMEZONE;
+            case TIMESTAMP_WITHOUT_TIME_ZONE:
+                return jdbcType == Types.TIMESTAMP
+                        && !typeName.contains("tz")
+                        && !typeName.contains("time zone");
+            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+            case TIMESTAMP_WITH_TIME_ZONE:
+                return jdbcType == Types.TIMESTAMP_WITH_TIMEZONE
+                        || typeName.contains("timestamptz")
+                        || typeName.contains("time zone");
+            default:
+                return false;
         }
     }
 
