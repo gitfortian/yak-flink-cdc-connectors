@@ -1,13 +1,16 @@
 package io.yak.flink.cdc.connectors.e2e;
 
+import org.apache.flink.api.common.JobStatus;
+import org.apache.flink.api.common.restartstrategy.RestartStrategies;
 import org.apache.flink.cdc.common.configuration.Configuration;
 import org.apache.flink.cdc.common.pipeline.PipelineOptions;
 import org.apache.flink.cdc.common.pipeline.SchemaChangeBehavior;
-import org.apache.flink.cdc.composer.PipelineExecution;
 import org.apache.flink.cdc.composer.definition.PipelineDef;
 import org.apache.flink.cdc.composer.definition.SinkDef;
 import org.apache.flink.cdc.composer.definition.SourceDef;
 import org.apache.flink.cdc.composer.flink.FlinkPipelineComposer;
+import org.apache.flink.core.execution.JobClient;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -16,6 +19,9 @@ import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.utility.DockerImageName;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
@@ -25,11 +31,15 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.fail;
@@ -44,6 +54,7 @@ class MySqlToPostgresPipelineITCase {
     private static final String MYSQL_PASSWORD = "root";
     private static final String POSTGRES_USER = "postgres";
     private static final String POSTGRES_PASSWORD = "postgres";
+    private static final String JOB_NAME = "yak-jdbc-mysql-postgres-e2e";
     private static final Duration CONVERGENCE_TIMEOUT = Duration.ofSeconds(120);
     private static final Duration POLL_INTERVAL = Duration.ofMillis(500);
 
@@ -70,7 +81,9 @@ class MySqlToPostgresPipelineITCase {
 
     private static final AtomicReference<Throwable> PIPELINE_FAILURE = new AtomicReference<>();
     private static final AtomicBoolean STOPPING = new AtomicBoolean(false);
-    private static Thread pipelineThread;
+
+    private static JobClient jobClient;
+    private static Path checkpointDirectory;
 
     @BeforeAll
     static void beforeAll() throws Exception {
@@ -82,22 +95,31 @@ class MySqlToPostgresPipelineITCase {
 
         initializeSource();
         initializeTarget();
+        checkpointDirectory = Files.createTempDirectory("yak-jdbc-e2e-checkpoints-");
         startPipeline();
+        awaitJobStatus("initial Flink job startup", status -> status == JobStatus.RUNNING);
     }
 
     @AfterAll
     static void afterAll() throws Exception {
         STOPPING.set(true);
-        if (pipelineThread != null) {
-            pipelineThread.interrupt();
-            pipelineThread.join(5_000L);
+        if (jobClient != null) {
+            try {
+                JobStatus status = jobClient.getJobStatus().get(5, TimeUnit.SECONDS);
+                if (!status.isGloballyTerminalState()) {
+                    jobClient.cancel().get(10, TimeUnit.SECONDS);
+                }
+            } catch (Exception ignored) {
+                // best-effort cleanup; the forked E2E JVM is terminated after the suite.
+            }
         }
         POSTGRES.stop();
         MYSQL.stop();
+        deleteRecursively(checkpointDirectory);
     }
 
     @Test
-    void snapshotDmlSchemaEvolutionAndConnectionRecovery() throws Exception {
+    void snapshotDmlSchemaEvolutionConnectionAndCheckpointRecovery() throws Exception {
         awaitTargetRows(
                 "initial snapshot",
                 Arrays.asList("1|Alice", "2|Bob", "3|Carol"),
@@ -140,16 +162,44 @@ class MySqlToPostgresPipelineITCase {
                 Arrays.asList("1|Alice|active", "2|Bobby|active", "4|Dave|active"),
                 true);
 
+        // Connector-level connection recovery: kill the current backend session while the target
+        // database remains healthy. The next write must transparently reconnect.
         terminateSinkBackendConnections();
         executeMySql("INSERT INTO customers(id, name, status) VALUES (5, 'Eve', 'active')");
 
-        awaitTargetRows(
-                "write after PostgreSQL connection termination",
+        List<String> afterConnectionRecovery =
                 Arrays.asList(
                         "1|Alice|active",
                         "2|Bobby|active",
                         "4|Dave|active",
-                        "5|Eve|active"),
+                        "5|Eve|active");
+        awaitTargetRows(
+                "write after PostgreSQL connection termination", afterConnectionRecovery, true);
+
+        // Wait until at least two checkpoints newer than the currently completed checkpoint have
+        // finished. With maxConcurrentCheckpoints=1 this guarantees a checkpoint was initiated
+        // after the fully verified state above, so source/schema state is recoverable.
+        long checkpointBeforeFailure = latestCompletedCheckpointId();
+        awaitCompletedCheckpointAfter(checkpointBeforeFailure + 1);
+
+        // Flink-level recovery: make the target unavailable, produce a new CDC record and require
+        // the sink task to fail. Fixed-delay restart gives the test an observable RESTARTING window.
+        stopPostgresProcess();
+        executeMySql("INSERT INTO customers(id, name, status) VALUES (6, 'Frank', 'active')");
+        awaitJobStatus("Flink restart after target outage", status -> status == JobStatus.RESTARTING);
+
+        startPostgresProcess();
+        awaitJdbc("PostgreSQL restart", MySqlToPostgresPipelineITCase::openPostgresConnection);
+        awaitJobStatus("Flink running after checkpoint recovery", status -> status == JobStatus.RUNNING);
+
+        awaitTargetRows(
+                "CDC after checkpoint recovery",
+                Arrays.asList(
+                        "1|Alice|active",
+                        "2|Bobby|active",
+                        "4|Dave|active",
+                        "5|Eve|active",
+                        "6|Frank|active"),
                 true);
     }
 
@@ -179,7 +229,7 @@ class MySqlToPostgresPipelineITCase {
         }
     }
 
-    private static void startPipeline() {
+    private static void startPipeline() throws Exception {
         Map<String, String> sourceOptions = new LinkedHashMap<>();
         sourceOptions.put("hostname", MYSQL.getHost());
         sourceOptions.put("port", String.valueOf(MYSQL.getMappedPort(3306)));
@@ -204,7 +254,7 @@ class MySqlToPostgresPipelineITCase {
                 new SinkDef("yak-jdbc", "Yak JDBC PostgreSQL Sink", Configuration.fromMap(sinkOptions));
 
         Configuration pipelineConfig = new Configuration();
-        pipelineConfig.set(PipelineOptions.PIPELINE_NAME, "yak-jdbc-mysql-postgres-e2e");
+        pipelineConfig.set(PipelineOptions.PIPELINE_NAME, JOB_NAME);
         pipelineConfig.set(PipelineOptions.PIPELINE_PARALLELISM, 1);
         pipelineConfig.set(
                 PipelineOptions.PIPELINE_SCHEMA_CHANGE_BEHAVIOR, SchemaChangeBehavior.EVOLVE);
@@ -218,21 +268,26 @@ class MySqlToPostgresPipelineITCase {
                         Collections.emptyList(),
                         pipelineConfig);
 
-        PipelineExecution execution = FlinkPipelineComposer.ofMiniCluster().compose(pipelineDef);
-        pipelineThread =
-                new Thread(
-                        () -> {
-                            try {
-                                execution.execute();
-                            } catch (Throwable failure) {
-                                if (!STOPPING.get() && !(failure instanceof InterruptedException)) {
-                                    PIPELINE_FAILURE.compareAndSet(null, failure);
-                                }
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.enableCheckpointing(500L);
+        env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
+        env.getCheckpointConfig().setCheckpointTimeout(30_000L);
+        env.getCheckpointConfig().setCheckpointStorage(checkpointDirectory.toUri().toString());
+        env.setRestartStrategy(RestartStrategies.fixedDelayRestart(5, Duration.ofSeconds(5)));
+
+        // compose() translates the real Flink CDC Pipeline into this environment and adds the same
+        // framework JARs used in deployment. We execute the environment ourselves to keep JobClient
+        // access for status/recovery assertions.
+        FlinkPipelineComposer.ofApplicationCluster(env).compose(pipelineDef);
+        jobClient = env.executeAsync(JOB_NAME);
+        jobClient
+                .getJobExecutionResult()
+                .whenComplete(
+                        (result, failure) -> {
+                            if (failure != null && !STOPPING.get()) {
+                                PIPELINE_FAILURE.compareAndSet(null, failure);
                             }
-                        },
-                        "yak-jdbc-production-e2e-pipeline");
-        pipelineThread.setDaemon(true);
-        pipelineThread.start();
+                        });
     }
 
     private static void executeMySql(String... sqlStatements) throws SQLException {
@@ -263,6 +318,14 @@ class MySqlToPostgresPipelineITCase {
         assertThat(terminated)
                 .as("at least one PostgreSQL sink backend should be terminated")
                 .isGreaterThan(0);
+    }
+
+    private static void stopPostgresProcess() {
+        POSTGRES.getDockerClient().killContainerCmd(POSTGRES.getContainerId()).exec();
+    }
+
+    private static void startPostgresProcess() {
+        POSTGRES.getDockerClient().startContainerCmd(POSTGRES.getContainerId()).exec();
     }
 
     private static void awaitTargetRows(
@@ -335,6 +398,66 @@ class MySqlToPostgresPipelineITCase {
                 lastObservationFailure);
     }
 
+    private static void awaitJobStatus(String phase, Predicate<JobStatus> expected) throws Exception {
+        long deadline = System.nanoTime() + CONVERGENCE_TIMEOUT.toNanos();
+        JobStatus lastStatus = null;
+        Throwable lastFailure = null;
+
+        while (System.nanoTime() < deadline) {
+            assertPipelineHealthy();
+            try {
+                lastStatus = jobClient.getJobStatus().get(5, TimeUnit.SECONDS);
+                if (expected.test(lastStatus)) {
+                    return;
+                }
+                if (lastStatus.isGloballyTerminalState()) {
+                    fail("Flink job reached terminal state " + lastStatus + " during phase '" + phase + "'");
+                }
+                lastFailure = null;
+            } catch (java.util.concurrent.TimeoutException e) {
+                lastFailure = e;
+            }
+            Thread.sleep(POLL_INTERVAL.toMillis());
+        }
+
+        fail(
+                "Timed out waiting for Flink job status during phase '"
+                        + phase
+                        + "'. Last status="
+                        + lastStatus,
+                lastFailure);
+    }
+
+    private static void awaitCompletedCheckpointAfter(long minimumCheckpointId) throws Exception {
+        awaitCondition(
+                "completed checkpoint >= " + minimumCheckpointId,
+                () -> latestCompletedCheckpointId() >= minimumCheckpointId);
+    }
+
+    private static long latestCompletedCheckpointId() throws IOException {
+        if (checkpointDirectory == null || !Files.exists(checkpointDirectory)) {
+            return -1L;
+        }
+        try (Stream<Path> paths = Files.walk(checkpointDirectory)) {
+            return paths.filter(path -> "_metadata".equals(path.getFileName().toString()))
+                    .map(Path::getParent)
+                    .filter(parent -> parent != null)
+                    .map(Path::getFileName)
+                    .map(Path::toString)
+                    .filter(name -> name.startsWith("chk-"))
+                    .mapToLong(
+                            name -> {
+                                try {
+                                    return Long.parseLong(name.substring("chk-".length()));
+                                } catch (NumberFormatException ignored) {
+                                    return -1L;
+                                }
+                            })
+                    .max()
+                    .orElse(-1L);
+        }
+    }
+
     private static void assertPipelineHealthy() {
         Throwable failure = PIPELINE_FAILURE.get();
         if (failure != null) {
@@ -358,7 +481,7 @@ class MySqlToPostgresPipelineITCase {
                 return;
             } catch (SQLException e) {
                 last = e;
-                Thread.sleep(500L);
+                Thread.sleep(POLL_INTERVAL.toMillis());
             }
         }
         throw new SQLException(name + " did not become JDBC-ready", last);
@@ -388,7 +511,27 @@ class MySqlToPostgresPipelineITCase {
                 + ":"
                 + POSTGRES.getMappedPort(5432)
                 + "/"
-                + TARGET_DATABASE;
+                + TARGET_DATABASE
+                + "?connectTimeout=5&socketTimeout=5";
+    }
+
+    private static void deleteRecursively(Path root) {
+        if (root == null || !Files.exists(root)) {
+            return;
+        }
+        try (Stream<Path> paths = Files.walk(root)) {
+            paths.sorted(Comparator.reverseOrder())
+                    .forEach(
+                            path -> {
+                                try {
+                                    Files.deleteIfExists(path);
+                                } catch (IOException ignored) {
+                                    // best effort
+                                }
+                            });
+        } catch (IOException ignored) {
+            // best effort
+        }
     }
 
     @FunctionalInterface
