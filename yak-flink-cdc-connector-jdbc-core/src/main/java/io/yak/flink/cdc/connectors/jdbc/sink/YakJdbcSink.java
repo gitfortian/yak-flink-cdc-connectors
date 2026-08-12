@@ -1,7 +1,6 @@
 package io.yak.flink.cdc.connectors.jdbc.sink;
 
 import io.yak.flink.cdc.connectors.jdbc.JdbcSinkConfig;
-import io.yak.flink.cdc.connectors.jdbc.dialect.JdbcDialect;
 
 import org.apache.flink.api.connector.sink2.Sink;
 import org.apache.flink.api.connector.sink2.SinkWriter;
@@ -14,21 +13,19 @@ public final class YakJdbcSink implements Sink<Event> {
     private static final long serialVersionUID = 1L;
 
     private final JdbcSinkConfig config;
-    private final JdbcDialect dialect;
 
-    public YakJdbcSink(JdbcSinkConfig config, JdbcDialect dialect) {
+    public YakJdbcSink(JdbcSinkConfig config) {
         this.config = config;
-        this.dialect = dialect;
     }
 
     @SuppressWarnings("deprecation")
     @Override
     public SinkWriter<Event> createWriter(Sink.InitContext context) throws IOException {
-        return new YakJdbcWriter(config, dialect);
+        return new YakJdbcWriter(config);
     }
 
     @Override
     public SinkWriter<Event> createWriter(WriterInitContext context) throws IOException {
-        return new YakJdbcWriter(config, dialect);
+        return new YakJdbcWriter(config);
     }
 }

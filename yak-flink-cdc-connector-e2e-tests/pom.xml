@@ -14,17 +14,31 @@
     <name>Yak Flink CDC Connector E2E Tests</name>
 
     <dependencies>
+        <!--
+          Production deploys exactly one shaded Yak JDBC bundle JAR. E2E must exercise that
+          artifact instead of placing core/dialect implementation modules on Flink's classpath as
+          separate JARs. Exclusions prevent Maven from also adding the bundle's internal modules to
+          the E2E test runtime and accidentally creating duplicate connector type identities.
+        -->
         <dependency>
             <groupId>io.yak.flink.cdc</groupId>
-            <artifactId>yak-flink-cdc-connector-jdbc-core</artifactId>
+            <artifactId>yak-flink-cdc-connector-jdbc</artifactId>
             <version>${project.version}</version>
             <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>io.yak.flink.cdc</groupId>
-            <artifactId>yak-flink-cdc-connector-jdbc-postgres</artifactId>
-            <version>${project.version}</version>
-            <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>io.yak.flink.cdc</groupId>
+                    <artifactId>yak-flink-cdc-connector-jdbc-core</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>io.yak.flink.cdc</groupId>
+                    <artifactId>yak-flink-cdc-connector-jdbc-mysql</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>io.yak.flink.cdc</groupId>
+                    <artifactId>yak-flink-cdc-connector-jdbc-postgres</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <dependency>

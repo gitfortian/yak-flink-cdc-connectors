@@ -2,6 +2,7 @@ package io.yak.flink.cdc.connectors.jdbc.sink;
 
 import io.yak.flink.cdc.connectors.jdbc.JdbcSinkConfig;
 import io.yak.flink.cdc.connectors.jdbc.dialect.JdbcDialect;
+import io.yak.flink.cdc.connectors.jdbc.dialect.JdbcDialectRegistry;
 import io.yak.flink.cdc.connectors.jdbc.runtime.JdbcConnectionProvider;
 
 import org.apache.flink.cdc.common.event.AddColumnEvent;
@@ -26,14 +27,14 @@ public final class YakJdbcMetadataApplier implements MetadataApplier {
     private static final long serialVersionUID = 1L;
 
     private final JdbcSinkConfig config;
-    private final JdbcDialect dialect;
-    private final JdbcConnectionProvider connectionProvider;
     private Set<SchemaChangeEventType> acceptedTypes = supportedTypes();
 
-    public YakJdbcMetadataApplier(JdbcSinkConfig config, JdbcDialect dialect) {
+    // Runtime resources must not cross Flink's client/JobMaster classloader serialization boundary.
+    private transient JdbcDialect dialect;
+    private transient JdbcConnectionProvider connectionProvider;
+
+    public YakJdbcMetadataApplier(JdbcSinkConfig config) {
         this.config = config;
-        this.dialect = dialect;
-        this.connectionProvider = new JdbcConnectionProvider(config);
     }
 
     @Override
@@ -44,14 +45,15 @@ public final class YakJdbcMetadataApplier implements MetadataApplier {
 
         if (event instanceof CreateTableEvent) {
             execute(
-                    dialect.buildCreateTableStatement(
-                            event.tableId(), ((CreateTableEvent) event).getSchema()));
+                    dialect()
+                            .buildCreateTableStatement(
+                                    event.tableId(), ((CreateTableEvent) event).getSchema()));
             return;
         }
         if (event instanceof AddColumnEvent) {
             for (AddColumnEvent.ColumnWithPosition added :
                     ((AddColumnEvent) event).getAddedColumns()) {
-                execute(dialect.buildAddColumnStatement(event.tableId(), added.getAddColumn()));
+                execute(dialect().buildAddColumnStatement(event.tableId(), added.getAddColumn()));
             }
             return;
         }
@@ -61,13 +63,14 @@ public final class YakJdbcMetadataApplier implements MetadataApplier {
                     .forEach(
                             (oldName, newName) ->
                                     execute(
-                                            dialect.buildRenameColumnStatement(
-                                                    event.tableId(), oldName, newName)));
+                                            dialect()
+                                                    .buildRenameColumnStatement(
+                                                            event.tableId(), oldName, newName)));
             return;
         }
         if (event instanceof DropColumnEvent) {
             for (String column : ((DropColumnEvent) event).getDroppedColumnNames()) {
-                execute(dialect.buildDropColumnStatement(event.tableId(), column));
+                execute(dialect().buildDropColumnStatement(event.tableId(), column));
             }
             return;
         }
@@ -77,16 +80,17 @@ public final class YakJdbcMetadataApplier implements MetadataApplier {
                     .forEach(
                             (column, type) ->
                                     execute(
-                                            dialect.buildAlterColumnTypeStatement(
-                                                    event.tableId(), column, type)));
+                                            dialect()
+                                                    .buildAlterColumnTypeStatement(
+                                                            event.tableId(), column, type)));
             return;
         }
         if (event instanceof TruncateTableEvent) {
-            execute(dialect.buildTruncateTableStatement(event.tableId()));
+            execute(dialect().buildTruncateTableStatement(event.tableId()));
             return;
         }
         if (event instanceof DropTableEvent) {
-            execute(dialect.buildDropTableStatement(event.tableId()));
+            execute(dialect().buildDropTableStatement(event.tableId()));
             return;
         }
 
@@ -113,6 +117,20 @@ public final class YakJdbcMetadataApplier implements MetadataApplier {
         return Collections.unmodifiableSet(supportedTypes());
     }
 
+    private JdbcDialect dialect() {
+        if (dialect == null) {
+            dialect = JdbcDialectRegistry.discoverRuntime(config.getDialect(), config.getUrl());
+        }
+        return dialect;
+    }
+
+    private JdbcConnectionProvider connectionProvider() {
+        if (connectionProvider == null) {
+            connectionProvider = new JdbcConnectionProvider(config);
+        }
+        return connectionProvider;
+    }
+
     private static EnumSet<SchemaChangeEventType> supportedTypes() {
         return EnumSet.of(
                 SchemaChangeEventType.CREATE_TABLE,
@@ -127,7 +145,7 @@ public final class YakJdbcMetadataApplier implements MetadataApplier {
     private void execute(String sql) {
         SQLException last = null;
         for (int attempt = 0; attempt <= config.getMaxRetries(); attempt++) {
-            try (Connection connection = connectionProvider.open();
+            try (Connection connection = connectionProvider().open();
                     Statement statement = connection.createStatement()) {
                 statement.executeUpdate(sql);
                 return;
