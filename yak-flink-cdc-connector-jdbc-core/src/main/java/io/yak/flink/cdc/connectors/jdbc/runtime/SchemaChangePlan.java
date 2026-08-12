@@ -19,9 +19,6 @@ public final class SchemaChangePlan {
         this.tableId = Objects.requireNonNull(tableId, "tableId");
         this.eventType = Objects.requireNonNull(eventType, "eventType");
         this.steps = Collections.unmodifiableList(new ArrayList<>(steps));
-        if (this.steps.isEmpty()) {
-            throw new IllegalArgumentException("Schema change plan must contain at least one step");
-        }
     }
 
     public TableId getTableId() {
@@ -34,6 +31,10 @@ public final class SchemaChangePlan {
 
     public List<SchemaChangeStep> getSteps() {
         return steps;
+    }
+
+    public boolean isNoOp() {
+        return steps.isEmpty();
     }
 
     public String describe() {
