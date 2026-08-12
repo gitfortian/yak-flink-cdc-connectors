@@ -33,8 +33,20 @@ public interface JdbcDialect extends Serializable {
         return tableId.getSchemaName();
     }
 
-    /** Returns whether target JDBC metadata represents the requested Flink CDC column type. */
-    boolean isColumnTypeCompatible(DataType expectedType, JdbcColumnMetadata actualColumn);
+    /**
+     * Returns whether target JDBC metadata represents the requested Flink CDC column type.
+     *
+     * <p>This is a default method so third-party dialect implementations compiled against the
+     * earlier SPI remain loadable. A dialect that wants replay-safe schema reconciliation must
+     * implement the method explicitly; silently guessing compatibility is not safe.
+     */
+    default boolean isColumnTypeCompatible(
+            DataType expectedType, JdbcColumnMetadata actualColumn) {
+        throw new UnsupportedOperationException(
+                "JDBC dialect '"
+                        + identifier()
+                        + "' must implement column metadata compatibility for replay-safe DDL");
+    }
 
     String buildCreateTableStatement(TableId tableId, Schema schema);
 
