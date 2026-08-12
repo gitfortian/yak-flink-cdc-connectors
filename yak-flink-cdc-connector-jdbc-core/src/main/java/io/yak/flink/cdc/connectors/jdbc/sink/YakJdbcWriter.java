@@ -139,8 +139,8 @@ public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWri
         }
 
         // An UPDATE may change a primary-key value. A plain upsert of the after image would leave
-        // the old primary-key row behind. Delete the old key first; delete + upsert are both
-        // idempotent and are committed in the same ordered batch transaction.
+        // the old primary-key row behind. Treat DELETE old key + UPSERT new row as one logical
+        // mutation so batch-size/max-batch-bytes can never split the pair across transactions.
         if (operation == OperationType.UPDATE) {
             RecordData before = event.before();
             if (before == null) {
@@ -151,10 +151,13 @@ public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWri
             List<Object> oldKey = extractPrimaryKeyValues(before, schema, event.tableId());
             List<Object> newKey = extractPrimaryKeyValues(after, schema, event.tableId());
             if (!oldKey.equals(newKey)) {
-                buffer(
+                bufferPrimaryKeyMutation(
                         event.tableId(),
                         dialect.buildDeleteStatement(event.tableId(), schema),
-                        oldKey);
+                        oldKey,
+                        dialect.buildUpsertStatement(event.tableId(), schema),
+                        JdbcValueConverter.toJdbcValues(after, schema));
+                return;
             }
         } else {
             // Validate key values before buffering INSERT/REPLACE as well.
@@ -225,6 +228,31 @@ public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWri
             keyValues.add(keyValue);
         }
         return keyValues;
+    }
+
+    private void bufferPrimaryKeyMutation(
+            TableId tableId,
+            String deleteSql,
+            List<Object> oldKey,
+            String upsertSql,
+            List<Object> newRow)
+            throws IOException {
+        // This two-statement logical event must never straddle two commits. Flush older pending work
+        // first, then add the pair without intermediate threshold checks. The pair may temporarily
+        // exceed a configured size/byte threshold, just like one oversized input record, and is
+        // immediately flushed afterward when required.
+        if (!batchBuffer.isEmpty()) {
+            flush(false);
+        }
+
+        batchBuffer.add(tableId, deleteSql, oldKey);
+        batchBuffer.add(tableId, upsertSql, newRow);
+        scheduleFlushIfNeeded();
+
+        if (batchBuffer.size() >= config.getBatchSize()
+                || batchBuffer.estimatedBytes() >= config.getMaxBatchBytes()) {
+            flush(false);
+        }
     }
 
     private void buffer(TableId tableId, String sql, List<Object> values) throws IOException {
