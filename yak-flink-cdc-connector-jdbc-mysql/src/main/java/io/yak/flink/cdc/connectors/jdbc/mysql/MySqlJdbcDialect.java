@@ -1,6 +1,7 @@
 package io.yak.flink.cdc.connectors.jdbc.mysql;
 
 import io.yak.flink.cdc.connectors.jdbc.dialect.AbstractJdbcDialect;
+import io.yak.flink.cdc.connectors.jdbc.dialect.JdbcColumnMetadata;
 
 import org.apache.flink.cdc.common.event.TableId;
 import org.apache.flink.cdc.common.schema.Column;
@@ -8,7 +9,11 @@ import org.apache.flink.cdc.common.schema.Schema;
 import org.apache.flink.cdc.common.types.DataType;
 import org.apache.flink.cdc.common.types.DataTypeChecks;
 
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.Types;
 import java.util.List;
+import java.util.Locale;
 import java.util.stream.Collectors;
 
 public final class MySqlJdbcDialect extends AbstractJdbcDialect {
@@ -65,6 +70,77 @@ public final class MySqlJdbcDialect extends AbstractJdbcDialect {
             default:
                 throw new UnsupportedOperationException(
                         "Unsupported MySQL target type in MVP: " + type.asSummaryString());
+        }
+    }
+
+    @Override
+    public String metadataCatalog(Connection connection, TableId tableId) throws SQLException {
+        // MySQL exposes databases as JDBC catalogs rather than JDBC schemas.
+        return tableId.getSchemaName();
+    }
+
+    @Override
+    public String metadataSchema(Connection connection, TableId tableId) throws SQLException {
+        return null;
+    }
+
+    @Override
+    public boolean isColumnTypeCompatible(DataType expectedType, JdbcColumnMetadata actualColumn) {
+        if (expectedType.isNullable() != actualColumn.isNullable()) {
+            return false;
+        }
+
+        int jdbcType = actualColumn.getJdbcType();
+        String typeName = actualColumn.getTypeName().toLowerCase(Locale.ROOT);
+        switch (expectedType.getTypeRoot()) {
+            case BOOLEAN:
+                // Connector/J may expose TINYINT(1)/BOOLEAN as BIT depending on driver settings.
+                return jdbcType == Types.BIT
+                        || jdbcType == Types.BOOLEAN
+                        || jdbcType == Types.TINYINT;
+            case TINYINT:
+                return jdbcType == Types.TINYINT;
+            case SMALLINT:
+                return jdbcType == Types.SMALLINT;
+            case INTEGER:
+                return jdbcType == Types.INTEGER;
+            case BIGINT:
+                return jdbcType == Types.BIGINT;
+            case FLOAT:
+                return jdbcType == Types.FLOAT || jdbcType == Types.REAL;
+            case DOUBLE:
+                return jdbcType == Types.DOUBLE;
+            case DECIMAL:
+                return (jdbcType == Types.DECIMAL || jdbcType == Types.NUMERIC)
+                        && actualColumn.getColumnSize() == DataTypeChecks.getPrecision(expectedType)
+                        && actualColumn.getDecimalDigits() == DataTypeChecks.getScale(expectedType);
+            case CHAR:
+                return jdbcType == Types.CHAR
+                        && actualColumn.getColumnSize() == DataTypeChecks.getLength(expectedType);
+            case VARCHAR:
+                int expectedLength = DataTypeChecks.getLength(expectedType);
+                if (expectedLength > 65535) {
+                    return jdbcType == Types.LONGVARCHAR
+                            || typeName.equals("text")
+                            || typeName.equals("mediumtext")
+                            || typeName.equals("longtext");
+                }
+                return jdbcType == Types.VARCHAR
+                        && actualColumn.getColumnSize() == expectedLength;
+            case BINARY:
+            case VARBINARY:
+                return jdbcType == Types.BLOB
+                        || jdbcType == Types.LONGVARBINARY
+                        || typeName.endsWith("blob");
+            case DATE:
+                return jdbcType == Types.DATE;
+            case TIME_WITHOUT_TIME_ZONE:
+                return jdbcType == Types.TIME;
+            case TIMESTAMP_WITHOUT_TIME_ZONE:
+            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+                return jdbcType == Types.TIMESTAMP || typeName.equals("datetime");
+            default:
+                return false;
         }
     }
 
