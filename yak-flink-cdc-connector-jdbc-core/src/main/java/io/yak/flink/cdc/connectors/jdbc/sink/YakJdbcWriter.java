@@ -3,10 +3,13 @@ package io.yak.flink.cdc.connectors.jdbc.sink;
 import io.yak.flink.cdc.connectors.jdbc.JdbcSinkConfig;
 import io.yak.flink.cdc.connectors.jdbc.dialect.JdbcDialect;
 import io.yak.flink.cdc.connectors.jdbc.dialect.JdbcDialectRegistry;
+import io.yak.flink.cdc.connectors.jdbc.runtime.JdbcBatchBuffer;
+import io.yak.flink.cdc.connectors.jdbc.runtime.JdbcBatchExecutor;
 import io.yak.flink.cdc.connectors.jdbc.runtime.JdbcConnectionProvider;
 import io.yak.flink.cdc.connectors.jdbc.runtime.JdbcValueConverter;
 import io.yak.flink.cdc.connectors.jdbc.state.YakJdbcWriterState;
 
+import org.apache.flink.api.common.operators.ProcessingTimeService;
 import org.apache.flink.api.connector.sink2.SinkWriter;
 import org.apache.flink.api.connector.sink2.StatefulSinkWriter;
 import org.apache.flink.cdc.common.data.RecordData;
@@ -21,39 +24,56 @@ import org.apache.flink.cdc.common.schema.Schema;
 import org.apache.flink.cdc.common.utils.SchemaUtils;
 
 import java.io.IOException;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.SQLException;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ScheduledFuture;
 
 public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWriterState> {
 
     private final JdbcSinkConfig config;
     private final JdbcDialect dialect;
-    private final JdbcConnectionProvider connectionProvider;
     private final Map<TableId, Schema> schemas;
+    private final JdbcBatchBuffer batchBuffer;
+    private final JdbcBatchExecutor batchExecutor;
+    private final ProcessingTimeService processingTimeService;
 
-    private transient Connection connection;
+    private transient ScheduledFuture<?> flushTimer;
+    private transient boolean closed;
 
     public YakJdbcWriter(JdbcSinkConfig config) throws IOException {
-        this(config, Collections.emptyMap());
+        this(config, Collections.emptyMap(), null);
     }
 
     public YakJdbcWriter(JdbcSinkConfig config, Map<TableId, Schema> recoveredSchemas)
             throws IOException {
+        this(config, recoveredSchemas, null);
+    }
+
+    public YakJdbcWriter(
+            JdbcSinkConfig config,
+            Map<TableId, Schema> recoveredSchemas,
+            ProcessingTimeService processingTimeService)
+            throws IOException {
         this.config = config;
         this.dialect = JdbcDialectRegistry.discoverRuntime(config.getDialect(), config.getUrl());
-        this.connectionProvider = new JdbcConnectionProvider(config);
         this.schemas = new HashMap<>(recoveredSchemas);
-        this.connection = openConnection();
+        this.batchBuffer = new JdbcBatchBuffer();
+        this.batchExecutor =
+                new JdbcBatchExecutor(config, new JdbcConnectionProvider(config));
+        this.processingTimeService = processingTimeService;
+        scheduleNextFlush();
     }
 
     @Override
     public void write(Event event, SinkWriter.Context context) throws IOException {
         if (event instanceof SchemaChangeEvent) {
+            // Flink CDC 3.6 emits FlushEvent before schema evolution and its sink wrapper invokes
+            // SinkWriter.flush(false). Keep this defensive flush as well so direct/runtime variants
+            // cannot carry old-schema buffered rows across a schema boundary.
+            flush(false);
+            batchExecutor.invalidateStatements();
             applySchemaEvent((SchemaChangeEvent) event);
             return;
         }
@@ -70,7 +90,10 @@ public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWri
                             + ". The table schema must arrive before data or be restored from a checkpoint.");
         }
 
-        writeDataChange(change, schema);
+        bufferDataChange(change, schema);
+        if (batchBuffer.size() >= config.getBatchSize()) {
+            flush(false);
+        }
     }
 
     private void applySchemaEvent(SchemaChangeEvent event) {
@@ -92,11 +115,11 @@ public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWri
         schemas.put(event.tableId(), SchemaUtils.applySchemaChangeEvent(current, event));
     }
 
-    private void writeDataChange(DataChangeEvent event, Schema schema) throws IOException {
+    private void bufferDataChange(DataChangeEvent event, Schema schema) throws IOException {
         OperationType operation = event.op();
 
         if (operation == OperationType.DELETE) {
-            executeDelete(event, schema);
+            bufferDelete(event, schema);
             return;
         }
 
@@ -118,10 +141,10 @@ public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWri
                         ? dialect.buildInsertStatement(event.tableId(), schema)
                         : dialect.buildUpsertStatement(event.tableId(), schema);
         List<Object> values = JdbcValueConverter.toJdbcValues(event.after(), schema);
-        execute(sql, values);
+        batchBuffer.add(sql, values);
     }
 
-    private void executeDelete(DataChangeEvent event, Schema schema) throws IOException {
+    private void bufferDelete(DataChangeEvent event, Schema schema) throws IOException {
         if (schema.primaryKeys().isEmpty()) {
             throw new IOException(
                     "DELETE requires a primary key for table " + event.tableId().identifier());
@@ -138,76 +161,58 @@ public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWri
             }
             keyValues.add(allValues.get(index));
         }
-        execute(dialect.buildDeleteStatement(event.tableId(), schema), keyValues);
-    }
-
-    private void execute(String sql, List<Object> values) throws IOException {
-        SQLException last = null;
-        for (int attempt = 0; attempt <= config.getMaxRetries(); attempt++) {
-            try {
-                ensureConnection();
-                try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                    for (int i = 0; i < values.size(); i++) {
-                        statement.setObject(i + 1, values.get(i));
-                    }
-                    statement.executeUpdate();
-                    return;
-                }
-            } catch (SQLException e) {
-                last = e;
-                closeQuietly();
-                if (attempt == config.getMaxRetries()) {
-                    break;
-                }
-            }
-        }
-        throw new IOException("JDBC write failed after retries. SQL: " + sql, last);
-    }
-
-    private void ensureConnection() throws IOException {
-        try {
-            if (connection == null || connection.isClosed() || !connection.isValid(2)) {
-                connection = openConnection();
-            }
-        } catch (SQLException e) {
-            throw new IOException("Unable to validate JDBC connection", e);
-        }
-    }
-
-    private Connection openConnection() throws IOException {
-        try {
-            Connection opened = connectionProvider.open();
-            opened.setAutoCommit(true);
-            return opened;
-        } catch (SQLException | RuntimeException e) {
-            throw new IOException("Unable to open JDBC connection to " + config.getUrl(), e);
-        }
+        batchBuffer.add(dialect.buildDeleteStatement(event.tableId(), schema), keyValues);
     }
 
     @Override
-    public List<YakJdbcWriterState> snapshotState(long checkpointId) {
+    public List<YakJdbcWriterState> snapshotState(long checkpointId) throws IOException {
+        // The Flink Sink V2 operator also flushes on checkpoints. Flushing here makes the writer
+        // state contract explicit: a checkpoint never snapshots schema state while DML is still
+        // only present in the local JVM buffer.
+        flush(false);
         return Collections.singletonList(new YakJdbcWriterState(schemas));
     }
 
     @Override
-    public void flush(boolean endOfInput) {
-        // MVP uses autocommit row-wise writes; there is no pending client-side buffer.
+    public void flush(boolean endOfInput) throws IOException {
+        if (batchBuffer.isEmpty()) {
+            return;
+        }
+        batchExecutor.execute(batchBuffer);
+        batchBuffer.clear();
+    }
+
+    private void scheduleNextFlush() {
+        if (processingTimeService == null
+                || config.getFlushIntervalMillis() == 0
+                || closed) {
+            return;
+        }
+        long next =
+                processingTimeService.getCurrentProcessingTime()
+                        + config.getFlushIntervalMillis();
+        flushTimer = processingTimeService.registerTimer(next, this::onProcessingTime);
+    }
+
+    private void onProcessingTime(long timestamp) throws Exception {
+        if (closed) {
+            return;
+        }
+        flush(false);
+        scheduleNextFlush();
     }
 
     @Override
-    public void close() {
-        closeQuietly();
-    }
-
-    private void closeQuietly() {
-        if (connection != null) {
-            try {
-                connection.close();
-            } catch (SQLException ignored) {
-                // best effort
-            } finally {
-                connection = null;
-            }
+    public void close() throws Exception {
+        closed = true;
+        if (flushTimer != null) {
+            flushTimer.cancel(false);
+            flushTimer = null;
+        }
+        try {
+            flush(true);
+        } finally {
+            batchExecutor.close();
         }
     }
 }

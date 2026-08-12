@@ -14,6 +14,7 @@ import org.apache.flink.core.io.SimpleVersionedSerializer;
 
 import java.io.IOException;
 import java.util.Collection;
+import java.util.Collections;
 
 public final class YakJdbcSink
         implements Sink<Event>, SupportsWriterState<Event, YakJdbcWriterState> {
@@ -28,20 +29,25 @@ public final class YakJdbcSink
     @SuppressWarnings("deprecation")
     @Override
     public SinkWriter<Event> createWriter(Sink.InitContext context) throws IOException {
-        return new YakJdbcWriter(config);
+        return new YakJdbcWriter(
+                config, Collections.emptyMap(), context.getProcessingTimeService());
     }
 
     @Override
     public StatefulSinkWriter<Event, YakJdbcWriterState> createWriter(WriterInitContext context)
             throws IOException {
-        return new YakJdbcWriter(config);
+        return new YakJdbcWriter(
+                config, Collections.emptyMap(), context.getProcessingTimeService());
     }
 
     @Override
     public StatefulSinkWriter<Event, YakJdbcWriterState> restoreWriter(
             WriterInitContext context, Collection<YakJdbcWriterState> recoveredState)
             throws IOException {
-        return new YakJdbcWriter(config, YakJdbcWriterState.merge(recoveredState));
+        return new YakJdbcWriter(
+                config,
+                YakJdbcWriterState.merge(recoveredState),
+                context.getProcessingTimeService());
     }
 
     @Override

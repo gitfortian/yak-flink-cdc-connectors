@@ -27,7 +27,50 @@ Supported schema evolution:
 - truncate table
 - drop table
 
-The MVP uses row-wise JDBC writes and provides **at-least-once** delivery. Tables with primary keys are replay-safe because writes use database-native upsert semantics. Batch writing and 2PC/exactly-once are intentionally left for later milestones.
+The connector provides **at-least-once** delivery. Tables with primary keys are replay-safe because writes use database-native upsert/delete semantics. Strict 2PC/exactly-once is intentionally left for a later milestone.
+
+## JDBC batch writing
+
+Production writes are buffered and flushed through JDBC `PreparedStatement.addBatch()` / `executeBatch()` instead of issuing one autocommit `executeUpdate()` per CDC record.
+
+One flush is one JDBC transaction:
+
+```text
+CDC events
+   │
+   ▼
+ordered in-memory buffer
+   │
+   ├─ adjacent same SQL ──► one JDBC batch segment
+   │
+   ▼
+executeBatch() segment(s)
+   │
+   ▼
+commit once
+```
+
+The buffer preserves the original event order. Only **adjacent** records using the same SQL are coalesced. The connector never globally groups all upserts/deletes because doing so could reorder a stream such as `UPSERT -> DELETE -> UPSERT` and change the final database state.
+
+A pending batch is flushed when any of these conditions is reached:
+
+- `batch-size` records are buffered;
+- `flush-interval-ms` processing-time timer fires;
+- Flink calls `SinkWriter.flush(...)` for a checkpoint or end-of-input;
+- Flink CDC sends a `FlushEvent` before schema evolution;
+- the writer closes.
+
+Prepared statements are cached across normal flushes. A schema-change boundary flushes pending data and invalidates the statement cache before the writer adopts the new schema.
+
+If a batch fails, the connector rolls back the transaction, recreates the JDBC connection and retries the full ordered batch up to `max-retries`. An ambiguous commit can therefore replay a batch. Primary-key upserts/deletes remain idempotent under the connector's at-least-once contract; append-only tables without a primary key still carry duplicate risk after replay.
+
+Batch options:
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `batch-size` | `1000` | maximum buffered records before an immediate flush |
+| `flush-interval-ms` | `2000` | processing-time flush interval; `0` disables timed flush |
+| `max-retries` | `3` | maximum retry count after a JDBC batch failure |
 
 ## Compatibility
 
@@ -97,6 +140,8 @@ sink:
   username: postgres
   password: postgres
   dialect: postgres
+  batch-size: 1000
+  flush-interval-ms: 2000
 
 pipeline:
   name: mysql-to-postgres
@@ -115,7 +160,9 @@ More examples are under [`examples/`](examples/).
 3. The public Flink CDC dependency is isolated in the connector core.
 4. Compatibility is explicit and CI-tested per supported Flink CDC line.
 5. Production E2E tests must use real Flink CDC Pipeline execution and real databases, not mocks.
-6. Prefer upstream Apache capabilities when they become stable; keep Yak-specific dialects as extensions.
+6. DML batching must preserve CDC event order across tables and operation types.
+7. Schema evolution must flush old-schema DML before DDL and invalidate cached statements afterward.
+8. Prefer upstream Apache capabilities when they become stable; keep Yak-specific dialects as extensions.
 
 See [docs/architecture.md](docs/architecture.md).
 
