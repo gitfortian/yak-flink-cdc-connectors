@@ -13,6 +13,7 @@ import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.utility.DockerImageName;
 
+import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -31,8 +32,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** Real PostgreSQL gate proving executeBatch, transaction commits and prepared-statement reuse. */
+/** Real PostgreSQL gate proving production JDBC batch execution semantics. */
 class PostgresBatchExecutorITCase {
     private static final String DATABASE = "batch_test_db";
     private static final String SCHEMA = "batch_test";
@@ -155,6 +157,42 @@ class PostgresBatchExecutorITCase {
         assertThat(CountingBatchPostgresDriver.COMMITS.get()).isEqualTo(1);
     }
 
+    @Test
+    void permanentConstraintFailureRollsBackAndDoesNotRetryBatch() throws Exception {
+        JdbcSinkConfig config =
+                new JdbcSinkConfig(
+                        countingJdbcUrl(),
+                        CountingBatchPostgresDriver.class.getName(),
+                        USER,
+                        PASSWORD,
+                        "postgres",
+                        5,
+                        1000,
+                        2000L);
+
+        String insert =
+                "INSERT INTO \"" + SCHEMA + "\".records (id, name) VALUES (?, ?)";
+        JdbcBatchBuffer buffer = new JdbcBatchBuffer();
+        buffer.add(insert, Arrays.asList(1, "first"));
+        buffer.add(insert, Arrays.asList(1, "duplicate"));
+
+        try (JdbcBatchExecutor executor =
+                new JdbcBatchExecutor(config, new JdbcConnectionProvider(config))) {
+            assertThatThrownBy(() -> executor.execute(buffer))
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining("JDBC batch flush failed");
+        }
+
+        assertThat(rowCount())
+                .as("a permanent batch failure must roll back the whole JDBC transaction")
+                .isZero();
+        assertThat(CountingBatchPostgresDriver.EXECUTE_BATCHES.get())
+                .as("SQLState 23 constraint failures must fail fast instead of consuming retries")
+                .isEqualTo(1);
+        assertThat(CountingBatchPostgresDriver.COMMITS.get()).isZero();
+        assertThat(CountingBatchPostgresDriver.ROLLBACKS.get()).isEqualTo(1);
+    }
+
     private static int rowCount() throws SQLException {
         try (Connection connection = openConnection();
                 Statement statement = connection.createStatement();
@@ -218,6 +256,7 @@ class PostgresBatchExecutorITCase {
         static final AtomicInteger EXECUTE_BATCHES = new AtomicInteger();
         static final AtomicInteger EXECUTE_UPDATES = new AtomicInteger();
         static final AtomicInteger COMMITS = new AtomicInteger();
+        static final AtomicInteger ROLLBACKS = new AtomicInteger();
 
         static {
             try {
@@ -232,6 +271,7 @@ class PostgresBatchExecutorITCase {
             EXECUTE_BATCHES.set(0);
             EXECUTE_UPDATES.set(0);
             COMMITS.set(0);
+            ROLLBACKS.set(0);
         }
 
         @Override
@@ -287,6 +327,11 @@ class PostgresBatchExecutorITCase {
                                 if ("commit".equals(method.getName())) {
                                     Object result = invoke(delegate, method, args);
                                     COMMITS.incrementAndGet();
+                                    return result;
+                                }
+                                if ("rollback".equals(method.getName())) {
+                                    Object result = invoke(delegate, method, args);
+                                    ROLLBACKS.incrementAndGet();
                                     return result;
                                 }
                                 return invoke(delegate, method, args);
