@@ -4,7 +4,15 @@ import io.yak.flink.cdc.connectors.jdbc.JdbcSinkConfig;
 import io.yak.flink.cdc.connectors.jdbc.runtime.JdbcBatchBuffer;
 import io.yak.flink.cdc.connectors.jdbc.runtime.JdbcBatchExecutor;
 import io.yak.flink.cdc.connectors.jdbc.runtime.JdbcConnectionProvider;
+import io.yak.flink.cdc.connectors.jdbc.sink.YakJdbcWriter;
 
+import org.apache.flink.cdc.common.data.GenericRecordData;
+import org.apache.flink.cdc.common.data.binary.BinaryStringData;
+import org.apache.flink.cdc.common.event.CreateTableEvent;
+import org.apache.flink.cdc.common.event.DataChangeEvent;
+import org.apache.flink.cdc.common.event.TableId;
+import org.apache.flink.cdc.common.schema.Schema;
+import org.apache.flink.cdc.common.types.DataTypes;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -13,6 +21,7 @@ import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.utility.DockerImageName;
 
+import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -31,8 +40,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** Real PostgreSQL gate proving executeBatch, transaction commits and prepared-statement reuse. */
+/** Real PostgreSQL gate proving production JDBC batch execution semantics. */
 class PostgresBatchExecutorITCase {
     private static final String DATABASE = "batch_test_db";
     private static final String SCHEMA = "batch_test";
@@ -67,7 +77,7 @@ class PostgresBatchExecutorITCase {
             statement.execute(
                     "CREATE TABLE \""
                             + SCHEMA
-                            + "\".records (id INTEGER PRIMARY KEY, name VARCHAR(64) NOT NULL)");
+                            + "\".records (id INTEGER PRIMARY KEY, name VARCHAR(8192) NOT NULL)");
         }
     }
 
@@ -121,6 +131,50 @@ class PostgresBatchExecutorITCase {
     }
 
     @Test
+    void writerFlushesOnByteBoundaryBeforeRecordCountBoundary() throws Exception {
+        JdbcSinkConfig config =
+                new JdbcSinkConfig(
+                        countingJdbcUrl(),
+                        CountingBatchPostgresDriver.class.getName(),
+                        USER,
+                        PASSWORD,
+                        "postgres",
+                        3,
+                        1000,
+                        0L,
+                        3000L);
+        TableId tableId = TableId.tableId(SCHEMA, "records");
+        Schema schema =
+                Schema.newBuilder()
+                        .physicalColumn("id", DataTypes.INT().notNull())
+                        .physicalColumn("name", DataTypes.VARCHAR(8192).notNull())
+                        .primaryKey("id")
+                        .build();
+        String payload = String.join("", java.util.Collections.nCopies(700, "x"));
+
+        try (YakJdbcWriter writer = new YakJdbcWriter(config)) {
+            writer.write(new CreateTableEvent(tableId, schema), null);
+            for (int id = 1; id <= 3; id++) {
+                writer.write(
+                        DataChangeEvent.insertEvent(
+                                tableId,
+                                GenericRecordData.of(
+                                        id, BinaryStringData.fromString(payload + id))),
+                        null);
+            }
+        }
+
+        assertThat(rowCount()).isEqualTo(3);
+        assertThat(CountingBatchPostgresDriver.EXECUTE_BATCHES.get())
+                .as("max-batch-bytes should flush large rows long before batch-size=1000")
+                .isEqualTo(3);
+        assertThat(CountingBatchPostgresDriver.COMMITS.get()).isEqualTo(3);
+        assertThat(CountingBatchPostgresDriver.PREPARES.get())
+                .as("byte-triggered flushes should still reuse the prepared statement")
+                .isEqualTo(1);
+    }
+
+    @Test
     void preservesInterleavedCdcOperationOrderAcrossBatchSegments() throws Exception {
         JdbcSinkConfig config =
                 new JdbcSinkConfig(
@@ -153,6 +207,42 @@ class PostgresBatchExecutorITCase {
         assertThat(nameFor(7)).isEqualTo("final");
         assertThat(CountingBatchPostgresDriver.EXECUTE_BATCHES.get()).isEqualTo(3);
         assertThat(CountingBatchPostgresDriver.COMMITS.get()).isEqualTo(1);
+    }
+
+    @Test
+    void permanentConstraintFailureRollsBackAndDoesNotRetryBatch() throws Exception {
+        JdbcSinkConfig config =
+                new JdbcSinkConfig(
+                        countingJdbcUrl(),
+                        CountingBatchPostgresDriver.class.getName(),
+                        USER,
+                        PASSWORD,
+                        "postgres",
+                        5,
+                        1000,
+                        2000L);
+
+        String insert =
+                "INSERT INTO \"" + SCHEMA + "\".records (id, name) VALUES (?, ?)";
+        JdbcBatchBuffer buffer = new JdbcBatchBuffer();
+        buffer.add(insert, Arrays.asList(1, "first"));
+        buffer.add(insert, Arrays.asList(1, "duplicate"));
+
+        try (JdbcBatchExecutor executor =
+                new JdbcBatchExecutor(config, new JdbcConnectionProvider(config))) {
+            assertThatThrownBy(() -> executor.execute(buffer))
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining("JDBC batch flush failed");
+        }
+
+        assertThat(rowCount())
+                .as("a permanent batch failure must roll back the whole JDBC transaction")
+                .isZero();
+        assertThat(CountingBatchPostgresDriver.EXECUTE_BATCHES.get())
+                .as("SQLState 23 constraint failures must fail fast instead of consuming retries")
+                .isEqualTo(1);
+        assertThat(CountingBatchPostgresDriver.COMMITS.get()).isZero();
+        assertThat(CountingBatchPostgresDriver.ROLLBACKS.get()).isEqualTo(1);
     }
 
     private static int rowCount() throws SQLException {
@@ -218,6 +308,7 @@ class PostgresBatchExecutorITCase {
         static final AtomicInteger EXECUTE_BATCHES = new AtomicInteger();
         static final AtomicInteger EXECUTE_UPDATES = new AtomicInteger();
         static final AtomicInteger COMMITS = new AtomicInteger();
+        static final AtomicInteger ROLLBACKS = new AtomicInteger();
 
         static {
             try {
@@ -232,6 +323,7 @@ class PostgresBatchExecutorITCase {
             EXECUTE_BATCHES.set(0);
             EXECUTE_UPDATES.set(0);
             COMMITS.set(0);
+            ROLLBACKS.set(0);
         }
 
         @Override
@@ -287,6 +379,11 @@ class PostgresBatchExecutorITCase {
                                 if ("commit".equals(method.getName())) {
                                     Object result = invoke(delegate, method, args);
                                     COMMITS.incrementAndGet();
+                                    return result;
+                                }
+                                if ("rollback".equals(method.getName())) {
+                                    Object result = invoke(delegate, method, args);
+                                    ROLLBACKS.incrementAndGet();
                                     return result;
                                 }
                                 return invoke(delegate, method, args);

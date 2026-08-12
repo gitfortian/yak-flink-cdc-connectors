@@ -49,6 +49,7 @@ public final class YakJdbcDataSinkFactory implements DataSinkFactory {
         options.add(JdbcSinkOptions.MAX_RETRIES);
         options.add(JdbcSinkOptions.BATCH_SIZE);
         options.add(JdbcSinkOptions.FLUSH_INTERVAL_MILLIS);
+        options.add(JdbcSinkOptions.MAX_BATCH_BYTES);
         return options;
     }
 }

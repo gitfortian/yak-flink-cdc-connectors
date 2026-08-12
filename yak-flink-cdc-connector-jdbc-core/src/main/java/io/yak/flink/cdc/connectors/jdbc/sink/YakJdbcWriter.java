@@ -63,7 +63,6 @@ public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWri
         this.batchExecutor =
                 new JdbcBatchExecutor(config, new JdbcConnectionProvider(config));
         this.processingTimeService = processingTimeService;
-        scheduleNextFlush();
     }
 
     @Override
@@ -91,9 +90,6 @@ public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWri
         }
 
         bufferDataChange(change, schema);
-        if (batchBuffer.size() >= config.getBatchSize()) {
-            flush(false);
-        }
     }
 
     private void applySchemaEvent(SchemaChangeEvent event) {
@@ -141,7 +137,7 @@ public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWri
                         ? dialect.buildInsertStatement(event.tableId(), schema)
                         : dialect.buildUpsertStatement(event.tableId(), schema);
         List<Object> values = JdbcValueConverter.toJdbcValues(event.after(), schema);
-        batchBuffer.add(sql, values);
+        buffer(sql, values);
     }
 
     private void bufferDelete(DataChangeEvent event, Schema schema) throws IOException {
@@ -161,7 +157,25 @@ public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWri
             }
             keyValues.add(allValues.get(index));
         }
-        batchBuffer.add(dialect.buildDeleteStatement(event.tableId(), schema), keyValues);
+        buffer(dialect.buildDeleteStatement(event.tableId(), schema), keyValues);
+    }
+
+    private void buffer(String sql, List<Object> values) throws IOException {
+        // Flush the existing batch before retaining a record that would cross the configured memory
+        // boundary. A single record may itself be larger than max-batch-bytes; in that case it is
+        // accepted as the only record and flushed immediately below.
+        if (!batchBuffer.isEmpty()
+                && batchBuffer.wouldExceed(config.getMaxBatchBytes(), sql, values)) {
+            flush(false);
+        }
+
+        batchBuffer.add(sql, values);
+        scheduleFlushIfNeeded();
+
+        if (batchBuffer.size() >= config.getBatchSize()
+                || batchBuffer.estimatedBytes() >= config.getMaxBatchBytes()) {
+            flush(false);
+        }
     }
 
     @Override
@@ -176,16 +190,21 @@ public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWri
     @Override
     public void flush(boolean endOfInput) throws IOException {
         if (batchBuffer.isEmpty()) {
+            cancelFlushTimer();
             return;
         }
+
         batchExecutor.execute(batchBuffer);
         batchBuffer.clear();
+        cancelFlushTimer();
     }
 
-    private void scheduleNextFlush() {
+    private void scheduleFlushIfNeeded() {
         if (processingTimeService == null
                 || config.getFlushIntervalMillis() == 0
-                || closed) {
+                || closed
+                || batchBuffer.isEmpty()
+                || flushTimer != null) {
             return;
         }
         long next =
@@ -195,20 +214,26 @@ public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWri
     }
 
     private void onProcessingTime(long timestamp) throws Exception {
+        // The callback is the owner of this timer now; clear the reference before flushing so the
+        // flush path does not try to cancel the currently executing future.
+        flushTimer = null;
         if (closed) {
             return;
         }
         flush(false);
-        scheduleNextFlush();
+    }
+
+    private void cancelFlushTimer() {
+        if (flushTimer != null) {
+            flushTimer.cancel(false);
+            flushTimer = null;
+        }
     }
 
     @Override
     public void close() throws Exception {
         closed = true;
-        if (flushTimer != null) {
-            flushTimer.cancel(false);
-            flushTimer = null;
-        }
+        cancelFlushTimer();
         try {
             flush(true);
         } finally {

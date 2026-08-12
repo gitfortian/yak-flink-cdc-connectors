@@ -29,7 +29,33 @@ class JdbcBatchBufferTest {
     }
 
     @Test
-    void clearReleasesBufferedRecords() {
+    void estimatesRetainedPayloadAndDetectsByteBoundaryBeforeAdd() {
+        JdbcBatchBuffer buffer = new JdbcBatchBuffer();
+        buffer.add("UPSERT", Arrays.asList(1, "small"));
+
+        long current = buffer.estimatedBytes();
+        assertThat(current).isPositive();
+
+        String largeValue = String.join("", Collections.nCopies(1024, "x"));
+        assertThat(buffer.wouldExceed(current + 1024L, "UPSERT", Arrays.asList(2, largeValue)))
+                .isTrue();
+        assertThat(buffer.wouldExceed(current + 16_384L, "UPSERT", Arrays.asList(2, largeValue)))
+                .isFalse();
+    }
+
+    @Test
+    void countsBinaryPayloadAgainstMemoryBoundary() {
+        JdbcBatchBuffer buffer = new JdbcBatchBuffer();
+        byte[] payload = new byte[4096];
+
+        assertThat(buffer.wouldExceed(2048L, "INSERT", Collections.singletonList(payload)))
+                .isTrue();
+        buffer.add("INSERT", Collections.singletonList(payload));
+        assertThat(buffer.estimatedBytes()).isGreaterThan(4096L);
+    }
+
+    @Test
+    void clearReleasesBufferedRecordsAndByteAccounting() {
         JdbcBatchBuffer buffer = new JdbcBatchBuffer();
         buffer.add("UPSERT", Arrays.asList(1, "value"));
 
@@ -37,5 +63,6 @@ class JdbcBatchBufferTest {
 
         assertThat(buffer).matches(JdbcBatchBuffer::isEmpty);
         assertThat(buffer.getSegments()).isEmpty();
+        assertThat(buffer.estimatedBytes()).isZero();
     }
 }

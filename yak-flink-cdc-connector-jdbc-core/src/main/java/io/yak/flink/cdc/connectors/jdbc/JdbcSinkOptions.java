@@ -7,6 +7,7 @@ public final class JdbcSinkOptions {
 
     public static final int DEFAULT_BATCH_SIZE = 1000;
     public static final long DEFAULT_FLUSH_INTERVAL_MILLIS = 2000L;
+    public static final long DEFAULT_MAX_BATCH_BYTES = 16L * 1024L * 1024L;
 
     public static final ConfigOption<String> URL =
             ConfigOptions.key("url").stringType().noDefaultValue();
@@ -33,6 +34,11 @@ public final class JdbcSinkOptions {
             ConfigOptions.key("flush-interval-ms")
                     .longType()
                     .defaultValue(DEFAULT_FLUSH_INTERVAL_MILLIS);
+
+    public static final ConfigOption<Long> MAX_BATCH_BYTES =
+            ConfigOptions.key("max-batch-bytes")
+                    .longType()
+                    .defaultValue(DEFAULT_MAX_BATCH_BYTES);
 
     private JdbcSinkOptions() {}
 }
