@@ -70,12 +70,13 @@ public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWri
     @Override
     public void write(Event event, SinkWriter.Context context) throws IOException {
         if (event instanceof SchemaChangeEvent) {
+            SchemaChangeEvent schemaEvent = (SchemaChangeEvent) event;
             // Flink CDC 3.6 emits FlushEvent before schema evolution and its sink wrapper invokes
             // SinkWriter.flush(false). Keep this defensive flush as well so direct/runtime variants
             // cannot carry old-schema buffered rows across a schema boundary.
             flush(false);
-            batchExecutor.invalidateStatements(event.tableId());
-            applySchemaEvent((SchemaChangeEvent) event);
+            batchExecutor.invalidateStatements(schemaEvent.tableId());
+            applySchemaEvent(schemaEvent);
             return;
         }
         if (!(event instanceof DataChangeEvent)) {
