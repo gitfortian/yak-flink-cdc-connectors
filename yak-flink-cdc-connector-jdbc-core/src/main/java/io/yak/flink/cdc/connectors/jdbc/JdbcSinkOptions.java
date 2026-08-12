@@ -5,6 +5,9 @@ import org.apache.flink.cdc.common.configuration.ConfigOptions;
 
 public final class JdbcSinkOptions {
 
+    public static final int DEFAULT_BATCH_SIZE = 1000;
+    public static final long DEFAULT_FLUSH_INTERVAL_MILLIS = 2000L;
+
     public static final ConfigOption<String> URL =
             ConfigOptions.key("url").stringType().noDefaultValue();
 
@@ -22,6 +25,14 @@ public final class JdbcSinkOptions {
 
     public static final ConfigOption<Integer> MAX_RETRIES =
             ConfigOptions.key("max-retries").intType().defaultValue(3);
+
+    public static final ConfigOption<Integer> BATCH_SIZE =
+            ConfigOptions.key("batch-size").intType().defaultValue(DEFAULT_BATCH_SIZE);
+
+    public static final ConfigOption<Long> FLUSH_INTERVAL_MILLIS =
+            ConfigOptions.key("flush-interval-ms")
+                    .longType()
+                    .defaultValue(DEFAULT_FLUSH_INTERVAL_MILLIS);
 
     private JdbcSinkOptions() {}
 }
