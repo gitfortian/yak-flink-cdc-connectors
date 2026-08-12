@@ -2,7 +2,7 @@
 
 This module defines the production-oriented end-to-end verification contract for Yak Flink CDC connectors.
 
-The purpose is not to test isolated SQL builders. The purpose is to prove that a connector works when executed through the **real Apache Flink CDC Pipeline runtime**, against **real database processes**, using the **same Factory SPI** that production deployment uses.
+The purpose is not to test isolated SQL builders. The purpose is to prove that a connector works when executed through the **real Apache Flink CDC Pipeline runtime**, against **real database processes**, using the **same Factory SPI and distribution artifact** that production deployment uses.
 
 ## 1. Test topology
 
@@ -17,13 +17,16 @@ Apache Flink CDC 3.6.x / Flink 1.20.x
   │
   │ DataSinkFactory(type = yak-jdbc)
   ▼
-Yak JDBC Sink / PostgreSQL dialect
+yak-flink-cdc-connector-jdbc-<version>.jar
   │
+  │ PostgreSQL dialect inside the shaded bundle
   ▼
 PostgreSQL 16
 ```
 
 Databases run in Testcontainers. The Flink CDC job runs with the real `FlinkPipelineComposer`; Source and Sink are discovered and constructed through Flink CDC connector factories.
+
+The E2E runtime depends on the **final shaded distribution bundle**, not directly on `jdbc-core` or dialect modules. Maven exclusions prevent those internal modules from also appearing as separate runtime JARs. This mirrors the documented production deployment model and avoids testing an artifact topology that users never deploy.
 
 ## 2. Mandatory rules
 
@@ -32,14 +35,15 @@ Every production E2E case MUST follow these rules:
 1. **No mocked database.** Source and target must be real database containers.
 2. **No direct Writer invocation.** Do not call `YakJdbcWriter` directly as a substitute for Pipeline execution.
 3. **Use Flink CDC Factory SPI.** The sink must be selected through `type = yak-jdbc` / `SinkDef("yak-jdbc", ...)`.
-4. **Do not force Yak packages parent-first.** The test must preserve Flink's normal user-code classloader behavior so serialization/classloader bugs are caught before release.
-5. **Validate final data, not only counts.** Row count equality alone is insufficient.
-6. **Validate schema changes in the target database.** A schema event is successful only when target metadata and subsequent data writes both reflect it.
-7. **Use bounded waits.** Every asynchronous assertion must have a timeout and fail with useful diagnostics.
-8. **Inject at least one recoverable failure.** A production gate must prove that new CDC records still arrive after the failure.
-9. **Tests must be deterministic.** Avoid sleeps as synchronization. Poll observable database state instead.
-10. **Always clean up containers.** Tests must not depend on state left by previous runs.
-11. **Never log credentials or row payloads containing secrets.**
+4. **Use the final distribution bundle.** E2E must not place Yak core and dialect modules on the runtime classpath as separate connector JARs.
+5. **Do not force Yak packages parent-first.** The test must preserve Flink's normal user-code classloader behavior so serialization/classloader bugs are caught before release.
+6. **Validate final data, not only counts.** Row count equality alone is insufficient.
+7. **Validate schema changes in the target database.** A schema event is successful only when target metadata and subsequent data writes both reflect it.
+8. **Use bounded waits.** Every asynchronous assertion must have a timeout and fail with useful diagnostics.
+9. **Inject at least one recoverable failure.** A production gate must prove that new CDC records still arrive after the failure.
+10. **Tests must be deterministic.** Avoid sleeps as synchronization. Poll observable database state instead.
+11. **Always clean up containers.** Tests must not depend on state left by previous runs.
+12. **Never log credentials or row payloads containing secrets.**
 
 ## 3. Classloader and serialization contract
 
@@ -49,10 +53,11 @@ Connector runtime rules:
 
 - serializable `DataSink`, Flink `Sink` and `MetadataApplier` objects must carry stable configuration/state, not concrete plugin implementation instances;
 - concrete `JdbcDialect` implementations are runtime resources and must be resolved inside the runtime classloader boundary;
-- `ServiceLoader` must load dialect factories with the same classloader that defines the `JdbcDialect` SPI;
+- the runtime connector artifact must contain both the `JdbcDialect` SPI and its providers so a single user-code classloader owns their Java type identity;
+- `ServiceLoader` must load dialect factories from that runtime bundle;
 - E2E tests must not hide type-identity bugs by adding `io.yak.*` to Flink parent-first loader patterns.
 
-A `ClassCastException` between two classes with the same fully-qualified name is treated as a production-blocking classloader defect.
+A `ClassCastException` or `ServiceConfigurationError ... not a subtype` involving Yak classes is treated as a production-blocking classloader/artifact-layout defect.
 
 ## 4. Baseline scenario
 
@@ -167,7 +172,8 @@ Current gate:
 - `ADD COLUMN` schema evolution;
 - PostgreSQL connection termination and reconnect;
 - exact target-state comparison;
-- Flink client/JobMaster/TaskManager classloader serialization boundary.
+- Flink client/JobMaster/TaskManager classloader serialization boundary;
+- final distribution-bundle artifact topology.
 
 Next recovery gate:
 
