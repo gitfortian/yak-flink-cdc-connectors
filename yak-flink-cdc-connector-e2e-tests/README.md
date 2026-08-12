@@ -40,10 +40,11 @@ Every production E2E case MUST follow these rules:
 6. **Validate final data, not only counts.** Row count equality alone is insufficient.
 7. **Validate schema changes in the target database.** A schema event is successful only when target metadata and subsequent data writes both reflect it.
 8. **Use bounded waits.** Every asynchronous assertion must have a timeout and fail with useful diagnostics.
-9. **Inject at least one recoverable failure.** A production gate must prove that new CDC records still arrive after the failure.
-10. **Tests must be deterministic.** Avoid sleeps as synchronization. Poll observable database state instead.
-11. **Always clean up containers.** Tests must not depend on state left by previous runs.
-12. **Never log credentials or row payloads containing secrets.**
+9. **Inject recoverable failures at two levels.** Verify both connector-level JDBC reconnection and Flink-level checkpoint/restart recovery.
+10. **Wait for an observable completed checkpoint before failover.** A restart test that cannot prove a checkpoint existed is not a checkpoint-recovery test.
+11. **Tests must be deterministic.** Avoid sleeps as synchronization. Poll observable database state, checkpoint files, or Flink job status instead.
+12. **Always clean up containers and checkpoint state.** Tests must not depend on state left by previous runs.
+13. **Never log credentials or row payloads containing secrets.**
 
 ## 3. Classloader and serialization contract
 
@@ -61,7 +62,7 @@ A `ClassCastException` or `ServiceConfigurationError ... not a subtype` involvin
 
 ## 4. Baseline scenario
 
-`MySqlToPostgresPipelineITCase` is the initial production gate and must cover the following sequence in one real Pipeline:
+`MySqlToPostgresPipelineITCase` is the initial production gate and must cover the following sequence in one real Pipeline.
 
 ### Phase A — snapshot
 
@@ -90,13 +91,27 @@ The test must verify:
 - subsequent CDC writes use the evolved schema successfully;
 - existing expected rows contain the expected new-column values.
 
-### Phase D — recoverable target connection failure
+### Phase D — connector-level JDBC recovery
 
-Terminate the PostgreSQL backend connection used by the sink, then produce another source-side CDC record.
+Terminate the PostgreSQL backend connection used by the sink while PostgreSQL remains healthy, then produce another source-side CDC record.
 
-The connector passes only when it reconnects and the new record appears in PostgreSQL.
+The connector passes only when it reconnects and the new record appears in PostgreSQL without requiring a Flink job restart.
 
-This phase verifies the current MVP's connection-level recovery behavior. A later recovery suite will add checkpoint/savepoint and TaskManager/process restart scenarios as a separate production gate.
+### Phase E — checkpoint and Flink restart recovery
+
+The test must then prove recovery at the Flink runtime level:
+
+1. enable periodic checkpoints and a bounded fixed-delay restart strategy;
+2. wait until at least two newer completed checkpoints are observable after the last verified target state;
+3. stop the PostgreSQL container process without removing the container or its data;
+4. insert a new MySQL CDC row while the target is unavailable;
+5. verify the Flink job enters `RESTARTING`;
+6. restart PostgreSQL and wait for JDBC readiness;
+7. verify the Flink job returns to `RUNNING`;
+8. verify the post-checkpoint CDC row reaches PostgreSQL;
+9. verify the complete final target state remains exact and duplicate-free.
+
+This phase validates the interaction of source checkpoint state, at-least-once replay, PK upsert idempotency, sink recreation and Writer schema-cache reconstruction after a real task failure.
 
 ## 5. Data correctness contract
 
@@ -116,9 +131,19 @@ MAX(id) is equal
 at least one expected row exists
 ```
 
-Those checks can pass while UPDATE/DELETE handling is wrong.
+Those checks can pass while UPDATE/DELETE handling, replay, or recovery is wrong.
 
-## 6. Timeout policy
+After checkpoint recovery, the assertion must also prove that replay did not introduce duplicate logical rows.
+
+## 6. Checkpoint policy
+
+The baseline E2E enables Flink checkpointing with one concurrent checkpoint at a time.
+
+Before failure injection, record the latest completed checkpoint id and wait for **two newer completed checkpoints**. Waiting for two generations prevents a checkpoint that started before the last verified CDC event from being mistaken for a recovery point that contains that event.
+
+Completed checkpoints are observed through their `_metadata` files in a dedicated temporary checkpoint directory. Do not replace this with a fixed sleep.
+
+## 7. Timeout policy
 
 Default asynchronous convergence timeout: **120 seconds**.
 
@@ -127,12 +152,13 @@ Recommended polling interval: **500 ms**.
 A timeout failure should include:
 
 - the phase being awaited;
+- current Flink job status when relevant;
 - current target rows or target metadata when safe;
 - any Pipeline execution failure captured by the test harness.
 
-Do not solve flakes by adding arbitrary `Thread.sleep(...)` calls.
+Do not solve flakes by adding arbitrary `Thread.sleep(...)` calls as synchronization barriers.
 
-## 7. CI policy
+## 8. CI policy
 
 Normal connector build:
 
@@ -150,38 +176,41 @@ mvn -Pe2e -pl yak-flink-cdc-connector-e2e-tests -am verify
 
 GitHub Actions runs this as a dedicated Java 11 job with Docker available. A PR is not production-safe when the E2E job is red, even if compile/unit jobs are green.
 
-## 8. Adding new E2E cases
+## 9. Adding new E2E cases
 
 New cases should be named `*ITCase.java` and answer one concrete production-risk question.
 
 Good examples:
 
 - `MySqlToMySqlPipelineITCase`
-- `PostgresConnectionRecoveryITCase`
 - `SchemaEvolutionIdempotencyITCase`
-- `CheckpointRecoveryITCase`
+- `JobManagerFailoverITCase`
+- `LargeSnapshotITCase`
 
-Avoid broad tests that combine unrelated failure modes and become impossible to diagnose.
+Avoid broad tests that combine unrelated database-specific edge cases and become impossible to diagnose. The baseline MySQL-to-PostgreSQL test intentionally combines only the minimum lifecycle that every production JDBC sink must survive.
 
-## 9. Production gate roadmap
+## 10. Production gate roadmap
 
 Current gate:
 
 - snapshot;
 - insert/update/delete;
 - `ADD COLUMN` schema evolution;
-- PostgreSQL connection termination and reconnect;
-- exact target-state comparison;
+- PostgreSQL connection termination and connector reconnect;
+- completed checkpoint observation;
+- target outage causing a real Flink task failure;
+- Flink `RESTARTING -> RUNNING` recovery;
+- post-checkpoint CDC replay and exact final-state verification;
+- Writer schema-cache reconstruction after restart;
 - Flink client/JobMaster/TaskManager classloader serialization boundary;
 - final distribution-bundle artifact topology.
 
-Next recovery gate:
+Next reliability gates:
 
-- checkpoint enabled;
-- TaskManager/job failure after completed checkpoint;
-- restore from checkpoint;
-- replay/idempotency verification;
-- schema cache recovery verification.
+- explicit JobManager leadership failover;
+- DDL idempotency under ambiguous database/network failures;
+- repeated restart loops and bounded retry behavior;
+- no-primary-key policy tests.
 
 Next performance gate:
 
