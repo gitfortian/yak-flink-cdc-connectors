@@ -4,7 +4,15 @@ import io.yak.flink.cdc.connectors.jdbc.JdbcSinkConfig;
 import io.yak.flink.cdc.connectors.jdbc.runtime.JdbcBatchBuffer;
 import io.yak.flink.cdc.connectors.jdbc.runtime.JdbcBatchExecutor;
 import io.yak.flink.cdc.connectors.jdbc.runtime.JdbcConnectionProvider;
+import io.yak.flink.cdc.connectors.jdbc.sink.YakJdbcWriter;
 
+import org.apache.flink.cdc.common.data.GenericRecordData;
+import org.apache.flink.cdc.common.data.binary.BinaryStringData;
+import org.apache.flink.cdc.common.event.CreateTableEvent;
+import org.apache.flink.cdc.common.event.DataChangeEvent;
+import org.apache.flink.cdc.common.event.TableId;
+import org.apache.flink.cdc.common.schema.Schema;
+import org.apache.flink.cdc.common.types.DataTypes;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -69,7 +77,7 @@ class PostgresBatchExecutorITCase {
             statement.execute(
                     "CREATE TABLE \""
                             + SCHEMA
-                            + "\".records (id INTEGER PRIMARY KEY, name VARCHAR(64) NOT NULL)");
+                            + "\".records (id INTEGER PRIMARY KEY, name VARCHAR(8192) NOT NULL)");
         }
     }
 
@@ -120,6 +128,50 @@ class PostgresBatchExecutorITCase {
             assertThat(CountingBatchPostgresDriver.EXECUTE_UPDATES.get()).isZero();
             assertThat(CountingBatchPostgresDriver.COMMITS.get()).isEqualTo(2);
         }
+    }
+
+    @Test
+    void writerFlushesOnByteBoundaryBeforeRecordCountBoundary() throws Exception {
+        JdbcSinkConfig config =
+                new JdbcSinkConfig(
+                        countingJdbcUrl(),
+                        CountingBatchPostgresDriver.class.getName(),
+                        USER,
+                        PASSWORD,
+                        "postgres",
+                        3,
+                        1000,
+                        0L,
+                        3000L);
+        TableId tableId = TableId.tableId(SCHEMA, "records");
+        Schema schema =
+                Schema.newBuilder()
+                        .physicalColumn("id", DataTypes.INT().notNull())
+                        .physicalColumn("name", DataTypes.VARCHAR(8192).notNull())
+                        .primaryKey("id")
+                        .build();
+        String payload = String.join("", java.util.Collections.nCopies(700, "x"));
+
+        try (YakJdbcWriter writer = new YakJdbcWriter(config)) {
+            writer.write(new CreateTableEvent(tableId, schema), null);
+            for (int id = 1; id <= 3; id++) {
+                writer.write(
+                        DataChangeEvent.insertEvent(
+                                tableId,
+                                GenericRecordData.of(
+                                        id, BinaryStringData.fromString(payload + id))),
+                        null);
+            }
+        }
+
+        assertThat(rowCount()).isEqualTo(3);
+        assertThat(CountingBatchPostgresDriver.EXECUTE_BATCHES.get())
+                .as("max-batch-bytes should flush large rows long before batch-size=1000")
+                .isEqualTo(3);
+        assertThat(CountingBatchPostgresDriver.COMMITS.get()).isEqualTo(3);
+        assertThat(CountingBatchPostgresDriver.PREPARES.get())
+                .as("byte-triggered flushes should still reuse the prepared statement")
+                .isEqualTo(1);
     }
 
     @Test
