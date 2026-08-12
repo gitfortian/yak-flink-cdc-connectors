@@ -25,6 +25,7 @@
         <module>yak-flink-cdc-connector-jdbc-mysql</module>
         <module>yak-flink-cdc-connector-jdbc-postgres</module>
         <module>yak-flink-cdc-connector-jdbc</module>
+        <module>yak-flink-cdc-connector-e2e-tests</module>
     </modules>
 
     <properties>
@@ -33,11 +34,17 @@
         <flink-cdc.release>3.6.0</flink-cdc.release>
         <flink-cdc.artifact.version>3.6.0-1.20</flink-cdc.artifact.version>
         <flink.version>1.20.3</flink.version>
+        <scala.binary.version>2.12</scala.binary.version>
         <junit.version>5.13.1</junit.version>
         <assertj.version>3.24.2</assertj.version>
+        <testcontainers.version>1.21.4</testcontainers.version>
+        <mysql.driver.version>8.4.0</mysql.driver.version>
+        <postgresql.driver.version>42.7.7</postgresql.driver.version>
         <maven.compiler.plugin.version>3.13.0</maven.compiler.plugin.version>
         <maven.surefire.plugin.version>3.5.3</maven.surefire.plugin.version>
+        <maven.failsafe.plugin.version>3.5.3</maven.failsafe.plugin.version>
         <maven.shade.plugin.version>3.6.0</maven.shade.plugin.version>
+        <skipE2E>true</skipE2E>
     </properties>
 
     <dependencyManagement>
@@ -78,7 +85,21 @@
                         <useModulePath>false</useModulePath>
                     </configuration>
                 </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-failsafe-plugin</artifactId>
+                    <version>${maven.failsafe.plugin.version}</version>
+                </plugin>
             </plugins>
         </pluginManagement>
     </build>
+
+    <profiles>
+        <profile>
+            <id>e2e</id>
+            <properties>
+                <skipE2E>false</skipE2E>
+            </properties>
+        </profile>
+    </profiles>
 </project>
