@@ -32,15 +32,29 @@ Every production E2E case MUST follow these rules:
 1. **No mocked database.** Source and target must be real database containers.
 2. **No direct Writer invocation.** Do not call `YakJdbcWriter` directly as a substitute for Pipeline execution.
 3. **Use Flink CDC Factory SPI.** The sink must be selected through `type = yak-jdbc` / `SinkDef("yak-jdbc", ...)`.
-4. **Validate final data, not only counts.** Row count equality alone is insufficient.
-5. **Validate schema changes in the target database.** A schema event is successful only when target metadata and subsequent data writes both reflect it.
-6. **Use bounded waits.** Every asynchronous assertion must have a timeout and fail with useful diagnostics.
-7. **Inject at least one recoverable failure.** A production gate must prove that new CDC records still arrive after the failure.
-8. **Tests must be deterministic.** Avoid sleeps as synchronization. Poll observable database state instead.
-9. **Always clean up containers.** Tests must not depend on state left by previous runs.
-10. **Never log credentials or row payloads containing secrets.**
+4. **Do not force Yak packages parent-first.** The test must preserve Flink's normal user-code classloader behavior so serialization/classloader bugs are caught before release.
+5. **Validate final data, not only counts.** Row count equality alone is insufficient.
+6. **Validate schema changes in the target database.** A schema event is successful only when target metadata and subsequent data writes both reflect it.
+7. **Use bounded waits.** Every asynchronous assertion must have a timeout and fail with useful diagnostics.
+8. **Inject at least one recoverable failure.** A production gate must prove that new CDC records still arrive after the failure.
+9. **Tests must be deterministic.** Avoid sleeps as synchronization. Poll observable database state instead.
+10. **Always clean up containers.** Tests must not depend on state left by previous runs.
+11. **Never log credentials or row payloads containing secrets.**
 
-## 3. Baseline scenario
+## 3. Classloader and serialization contract
+
+Flink serializes connector objects between the client, JobMaster and TaskManagers. Production tests must therefore verify the real classloader boundary.
+
+Connector runtime rules:
+
+- serializable `DataSink`, Flink `Sink` and `MetadataApplier` objects must carry stable configuration/state, not concrete plugin implementation instances;
+- concrete `JdbcDialect` implementations are runtime resources and must be resolved inside the runtime classloader boundary;
+- `ServiceLoader` must load dialect factories with the same classloader that defines the `JdbcDialect` SPI;
+- E2E tests must not hide type-identity bugs by adding `io.yak.*` to Flink parent-first loader patterns.
+
+A `ClassCastException` between two classes with the same fully-qualified name is treated as a production-blocking classloader defect.
+
+## 4. Baseline scenario
 
 `MySqlToPostgresPipelineITCase` is the initial production gate and must cover the following sequence in one real Pipeline:
 
@@ -79,7 +93,7 @@ The connector passes only when it reconnects and the new record appears in Postg
 
 This phase verifies the current MVP's connection-level recovery behavior. A later recovery suite will add checkpoint/savepoint and TaskManager/process restart scenarios as a separate production gate.
 
-## 4. Data correctness contract
+## 5. Data correctness contract
 
 For primary-key tables, target verification should compare a canonical ordered representation, for example:
 
@@ -99,7 +113,7 @@ at least one expected row exists
 
 Those checks can pass while UPDATE/DELETE handling is wrong.
 
-## 5. Timeout policy
+## 6. Timeout policy
 
 Default asynchronous convergence timeout: **120 seconds**.
 
@@ -113,7 +127,7 @@ A timeout failure should include:
 
 Do not solve flakes by adding arbitrary `Thread.sleep(...)` calls.
 
-## 6. CI policy
+## 7. CI policy
 
 Normal connector build:
 
@@ -131,7 +145,7 @@ mvn -Pe2e -pl yak-flink-cdc-connector-e2e-tests -am verify
 
 GitHub Actions runs this as a dedicated Java 11 job with Docker available. A PR is not production-safe when the E2E job is red, even if compile/unit jobs are green.
 
-## 7. Adding new E2E cases
+## 8. Adding new E2E cases
 
 New cases should be named `*ITCase.java` and answer one concrete production-risk question.
 
@@ -144,7 +158,7 @@ Good examples:
 
 Avoid broad tests that combine unrelated failure modes and become impossible to diagnose.
 
-## 8. Production gate roadmap
+## 9. Production gate roadmap
 
 Current gate:
 
@@ -152,7 +166,8 @@ Current gate:
 - insert/update/delete;
 - `ADD COLUMN` schema evolution;
 - PostgreSQL connection termination and reconnect;
-- exact target-state comparison.
+- exact target-state comparison;
+- Flink client/JobMaster/TaskManager classloader serialization boundary.
 
 Next recovery gate:
 

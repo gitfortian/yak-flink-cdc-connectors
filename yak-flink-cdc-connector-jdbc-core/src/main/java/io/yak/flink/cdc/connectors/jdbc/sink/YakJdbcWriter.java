@@ -2,6 +2,7 @@ package io.yak.flink.cdc.connectors.jdbc.sink;
 
 import io.yak.flink.cdc.connectors.jdbc.JdbcSinkConfig;
 import io.yak.flink.cdc.connectors.jdbc.dialect.JdbcDialect;
+import io.yak.flink.cdc.connectors.jdbc.dialect.JdbcDialectRegistry;
 import io.yak.flink.cdc.connectors.jdbc.runtime.JdbcConnectionProvider;
 import io.yak.flink.cdc.connectors.jdbc.runtime.JdbcValueConverter;
 
@@ -34,9 +35,9 @@ public final class YakJdbcWriter implements SinkWriter<Event> {
 
     private transient Connection connection;
 
-    public YakJdbcWriter(JdbcSinkConfig config, JdbcDialect dialect) throws IOException {
+    public YakJdbcWriter(JdbcSinkConfig config) throws IOException {
         this.config = config;
-        this.dialect = dialect;
+        this.dialect = JdbcDialectRegistry.discoverRuntime(config.getDialect(), config.getUrl());
         this.connectionProvider = new JdbcConnectionProvider(config);
         this.connection = openConnection();
     }

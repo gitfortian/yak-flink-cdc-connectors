@@ -1,6 +1,5 @@
 package io.yak.flink.cdc.connectors.jdbc;
 
-import io.yak.flink.cdc.connectors.jdbc.dialect.JdbcDialect;
 import io.yak.flink.cdc.connectors.jdbc.dialect.JdbcDialectRegistry;
 import io.yak.flink.cdc.connectors.jdbc.sink.YakJdbcDataSink;
 
@@ -19,11 +18,13 @@ public final class YakJdbcDataSinkFactory implements DataSinkFactory {
         FactoryHelper.createFactoryHelper(this, context).validate();
 
         JdbcSinkConfig config = JdbcSinkConfig.from(context.getFactoryConfiguration());
-        JdbcDialect dialect =
-                JdbcDialectRegistry.discover(
-                        config.getDialect(), config.getUrl(), context.getClassLoader());
 
-        return new YakJdbcDataSink(config, dialect);
+        // Validate eagerly while the Factory context classloader is available, but deliberately do
+        // not retain the concrete dialect instance. Flink serializes sink objects across runtime
+        // classloader boundaries; the dialect is resolved again lazily on the runtime side.
+        JdbcDialectRegistry.discover(config.getDialect(), config.getUrl(), context.getClassLoader());
+
+        return new YakJdbcDataSink(config);
     }
 
     @Override

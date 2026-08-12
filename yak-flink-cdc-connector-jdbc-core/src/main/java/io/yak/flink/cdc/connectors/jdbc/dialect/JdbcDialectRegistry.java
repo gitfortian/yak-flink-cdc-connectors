@@ -45,6 +45,18 @@ public final class JdbcDialectRegistry {
                                                 + available(factories)));
     }
 
+    /**
+     * Resolves a dialect inside the runtime classloader boundary.
+     *
+     * <p>Flink serializes sink/coordinator objects between the client, JobMaster and TaskManagers.
+     * Concrete dialect instances must not cross that boundary because the connector can be loaded
+     * by different user-code classloaders. Loading the SPI with the same classloader that defined
+     * {@link JdbcDialect} guarantees that factories and the interface use one type identity.
+     */
+    public static JdbcDialect discoverRuntime(String requestedDialect, String jdbcUrl) {
+        return discover(requestedDialect, jdbcUrl, JdbcDialect.class.getClassLoader());
+    }
+
     private static String available(List<JdbcDialectFactory> factories) {
         return factories.stream()
                 .map(JdbcDialectFactory::identifier)
