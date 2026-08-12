@@ -1,0 +1,21 @@
+source:
+  type: mysql
+  hostname: localhost
+  port: 3306
+  username: root
+  password: root
+  tables: app_db.\.*
+
+sink:
+  type: yak-jdbc
+  url: jdbc:postgresql://localhost:5432/ods
+  driver: org.postgresql.Driver
+  username: postgres
+  password: postgres
+  dialect: postgres
+  max-retries: 3
+
+pipeline:
+  name: mysql-to-postgres
+  parallelism: 1
+  schema.change.behavior: evolve
