@@ -16,6 +16,7 @@ public final class JdbcSinkConfig implements Serializable {
     private final int maxRetries;
     private final int batchSize;
     private final long flushIntervalMillis;
+    private final long maxBatchBytes;
 
     public JdbcSinkConfig(
             String url,
@@ -32,7 +33,8 @@ public final class JdbcSinkConfig implements Serializable {
                 dialect,
                 maxRetries,
                 JdbcSinkOptions.DEFAULT_BATCH_SIZE,
-                JdbcSinkOptions.DEFAULT_FLUSH_INTERVAL_MILLIS);
+                JdbcSinkOptions.DEFAULT_FLUSH_INTERVAL_MILLIS,
+                JdbcSinkOptions.DEFAULT_MAX_BATCH_BYTES);
     }
 
     public JdbcSinkConfig(
@@ -44,6 +46,28 @@ public final class JdbcSinkConfig implements Serializable {
             int maxRetries,
             int batchSize,
             long flushIntervalMillis) {
+        this(
+                url,
+                driver,
+                username,
+                password,
+                dialect,
+                maxRetries,
+                batchSize,
+                flushIntervalMillis,
+                JdbcSinkOptions.DEFAULT_MAX_BATCH_BYTES);
+    }
+
+    public JdbcSinkConfig(
+            String url,
+            String driver,
+            String username,
+            String password,
+            String dialect,
+            int maxRetries,
+            int batchSize,
+            long flushIntervalMillis,
+            long maxBatchBytes) {
         this.url = Objects.requireNonNull(url, "url");
         this.driver = Objects.requireNonNull(driver, "driver");
         this.username = username == null ? "" : username;
@@ -58,9 +82,13 @@ public final class JdbcSinkConfig implements Serializable {
         if (flushIntervalMillis < 0) {
             throw new IllegalArgumentException("flush-interval-ms must be >= 0");
         }
+        if (maxBatchBytes <= 0) {
+            throw new IllegalArgumentException("max-batch-bytes must be > 0");
+        }
         this.maxRetries = maxRetries;
         this.batchSize = batchSize;
         this.flushIntervalMillis = flushIntervalMillis;
+        this.maxBatchBytes = maxBatchBytes;
     }
 
     public static JdbcSinkConfig from(Configuration configuration) {
@@ -72,7 +100,8 @@ public final class JdbcSinkConfig implements Serializable {
                 configuration.get(JdbcSinkOptions.DIALECT),
                 configuration.get(JdbcSinkOptions.MAX_RETRIES),
                 configuration.get(JdbcSinkOptions.BATCH_SIZE),
-                configuration.get(JdbcSinkOptions.FLUSH_INTERVAL_MILLIS));
+                configuration.get(JdbcSinkOptions.FLUSH_INTERVAL_MILLIS),
+                configuration.get(JdbcSinkOptions.MAX_BATCH_BYTES));
     }
 
     public String getUrl() {
@@ -105,5 +134,9 @@ public final class JdbcSinkConfig implements Serializable {
 
     public long getFlushIntervalMillis() {
         return flushIntervalMillis;
+    }
+
+    public long getMaxBatchBytes() {
+        return maxBatchBytes;
     }
 }
