@@ -8,6 +8,8 @@ public final class JdbcSinkOptions {
     public static final int DEFAULT_BATCH_SIZE = 1000;
     public static final long DEFAULT_FLUSH_INTERVAL_MILLIS = 2000L;
     public static final long DEFAULT_MAX_BATCH_BYTES = 16L * 1024L * 1024L;
+    public static final int DEFAULT_STATEMENT_CACHE_SIZE = 128;
+    public static final String DEFAULT_REPLAY_SAFETY = "strict";
 
     public static final ConfigOption<String> URL =
             ConfigOptions.key("url").stringType().noDefaultValue();
@@ -39,6 +41,16 @@ public final class JdbcSinkOptions {
             ConfigOptions.key("max-batch-bytes")
                     .longType()
                     .defaultValue(DEFAULT_MAX_BATCH_BYTES);
+
+    public static final ConfigOption<Integer> STATEMENT_CACHE_SIZE =
+            ConfigOptions.key("statement-cache-size")
+                    .intType()
+                    .defaultValue(DEFAULT_STATEMENT_CACHE_SIZE);
+
+    public static final ConfigOption<String> REPLAY_SAFETY =
+            ConfigOptions.key("replay-safety")
+                    .stringType()
+                    .defaultValue(DEFAULT_REPLAY_SAFETY);
 
     private JdbcSinkOptions() {}
 }
