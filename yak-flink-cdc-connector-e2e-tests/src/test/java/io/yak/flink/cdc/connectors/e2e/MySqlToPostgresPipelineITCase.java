@@ -50,6 +50,7 @@ class MySqlToPostgresPipelineITCase {
     private static final GenericContainer<?> MYSQL =
             new GenericContainer<>(DockerImageName.parse("mysql:8.0.40"))
                     .withEnv("MYSQL_ROOT_PASSWORD", MYSQL_PASSWORD)
+                    .withEnv("MYSQL_ROOT_HOST", "%")
                     .withEnv("MYSQL_DATABASE", SOURCE_DATABASE)
                     .withExposedPorts(3306)
                     .withCommand(
@@ -243,18 +244,25 @@ class MySqlToPostgresPipelineITCase {
     }
 
     private static void terminateSinkBackendConnections() throws SQLException {
-        try (Connection connection = openPostgresConnection(); Statement statement = connection.createStatement()) {
-            int terminated =
-                    statement.executeUpdate(
-                            "SELECT pg_terminate_backend(pid) "
-                                    + "FROM pg_stat_activity "
-                                    + "WHERE datname = current_database() "
-                                    + "AND usename = current_user "
-                                    + "AND pid <> pg_backend_pid()");
-            assertThat(terminated)
-                    .as("at least one PostgreSQL sink backend should be terminated")
-                    .isGreaterThan(0);
+        int terminated = 0;
+        try (Connection connection = openPostgresConnection();
+                Statement statement = connection.createStatement();
+                ResultSet rs =
+                        statement.executeQuery(
+                                "SELECT pg_terminate_backend(pid) "
+                                        + "FROM pg_stat_activity "
+                                        + "WHERE datname = current_database() "
+                                        + "AND usename = current_user "
+                                        + "AND pid <> pg_backend_pid()")) {
+            while (rs.next()) {
+                if (rs.getBoolean(1)) {
+                    terminated++;
+                }
+            }
         }
+        assertThat(terminated)
+                .as("at least one PostgreSQL sink backend should be terminated")
+                .isGreaterThan(0);
     }
 
     private static void awaitTargetRows(
