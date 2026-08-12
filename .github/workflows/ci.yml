@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        java: [11, 17]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+      - name: Verify
+        run: mvn -B -ntp clean verify
+      - name: Verify bundle isolation
+        shell: bash
+        run: |
+          JAR=$(ls yak-flink-cdc-connector-jdbc/target/yak-flink-cdc-connector-jdbc-*.jar | head -n 1)
+          jar tf "$JAR" | grep -q 'META-INF/services/org.apache.flink.cdc.common.factories.Factory'
+          jar tf "$JAR" | grep -q 'META-INF/services/io.yak.flink.cdc.connectors.jdbc.dialect.JdbcDialectFactory'
+          if jar tf "$JAR" | grep -q '^org/apache/flink/'; then
+            echo "Bundle must not contain Flink/Flink CDC classes"
+            exit 1
+          fi

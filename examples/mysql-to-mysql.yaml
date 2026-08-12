@@ -1,0 +1,21 @@
+source:
+  type: mysql
+  hostname: localhost
+  port: 3306
+  username: root
+  password: root
+  tables: app_db.\.*
+
+sink:
+  type: yak-jdbc
+  url: jdbc:mysql://localhost:3306/ods
+  driver: com.mysql.cj.jdbc.Driver
+  username: root
+  password: root
+  dialect: mysql
+  max-retries: 3
+
+pipeline:
+  name: mysql-to-mysql
+  parallelism: 1
+  schema.change.behavior: evolve
