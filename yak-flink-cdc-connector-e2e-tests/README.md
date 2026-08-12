@@ -47,6 +47,10 @@ Every production E2E case MUST follow these rules:
 13. **Never log credentials or row payloads containing secrets.**
 14. **Schema cache recovery is connector-owned.** A recovered JDBC writer must not depend on Flink CDC replaying `CreateTableEvent` before the first post-recovery DML event.
 15. **Ambiguous recovered schemas must fail fast.** Rescaling or restore must never silently choose one of two conflicting schema states for the same table.
+16. **DDL replay must be state-based, not exception-based.** Replaying the same schema event is successful only when target metadata proves the requested state is already present.
+17. **Ambiguous DDL acknowledgement loss must be reconciled.** After a JDBC failure, reconnect and inspect target metadata before deciding whether to retry or fail.
+18. **Same-name schema conflicts must never be hidden by `IF EXISTS` / `IF NOT EXISTS`.** Existing tables and columns must be structurally compatible with the requested event.
+19. **Permanent DDL failures must fail fast.** Syntax, permission, unsupported-operation and structural-conflict errors must not consume the transient retry budget.
 
 ## 3. Classloader and serialization contract
 
@@ -170,6 +174,69 @@ Unit tests must cover at least:
 
 The real E2E must continue to pass checkpoint/restart after schema evolution. Unit tests prove the state representation; E2E proves that it survives the actual Flink runtime/classloader boundary.
 
+## 5.1. DDL application safety contract
+
+Schema evolution is an at-least-once operation from the connector's point of view. A database can commit DDL before the JDBC client learns that it succeeded, so correctness must not depend on replaying the exact SQL and interpreting the second exception.
+
+Production behavior is defined as:
+
+```text
+SchemaChangeEvent
+       │
+       ▼
+inspect target JDBC metadata
+       │
+       ├─ requested state already present ──────────► success
+       │
+       ├─ incompatible same-name state ─────────────► fail fast
+       │
+       ▼
+execute DDL
+       │
+       ├─ success ──────────────────────────────────► success
+       │
+       └─ SQLException
+              │
+              ▼
+       reconnect + inspect target metadata
+              │
+              ├─ requested state now present ───────► success
+              ├─ incompatible target state ─────────► fail fast
+              └─ state not applied
+                       │
+                       ├─ transient/recoverable ─────► bounded retry
+                       └─ permanent ─────────────────► fail fast
+```
+
+The reconciliation state has three meanings:
+
+- `APPLIED`: target metadata already represents the requested schema event; replay is successful and no SQL is executed again;
+- `NOT_APPLIED`: target metadata is safe for the DDL to run or retry;
+- `CONFLICT`: target metadata cannot be explained as either pre-event or post-event state and requires operator intervention.
+
+Required invariants:
+
+- `CREATE TABLE` replay validates target columns, JDBC-compatible types, nullability and primary keys instead of trusting `IF NOT EXISTS`;
+- `ADD COLUMN` replay succeeds only when the same-name column has a compatible definition;
+- `RENAME COLUMN` replay treats `old missing + new present` as applied, while `old present + new present` and `old missing + new missing` are conflicts;
+- `DROP COLUMN` replay succeeds when the target column is already absent but does not silently accept a missing target table;
+- `ALTER COLUMN TYPE` replay succeeds only when target JDBC metadata is compatible with the requested new type;
+- `DROP TABLE` replay succeeds when the target table is already absent;
+- `TRUNCATE TABLE` may be replayed because the schema operator blocks subsequent data events while applying the schema event;
+- retryable failures are limited to recoverable/transient JDBC exceptions and SQLState classes representing connection failure or transaction rollback;
+- retry delay is bounded and permanent SQL failures do not spin through the retry budget;
+- dialect-specific metadata comparison must cover at least type family, length where relevant, precision/scale where relevant, and nullability;
+- an external dialect that cannot prove metadata compatibility must fail explicitly rather than guessing that an existing object is safe.
+
+`PostgresDdlReplayITCase` is the focused real-database gate. It must prove:
+
+- CREATE / ADD / RENAME / ALTER TYPE / DROP COLUMN / DROP TABLE can each be replayed against PostgreSQL;
+- incompatible same-name tables and columns fail fast;
+- a real PostgreSQL DDL can commit successfully while a test JDBC wrapper deliberately discards the acknowledgement and throws `SQLRecoverableException`;
+- the connector reconnects after that simulated lost acknowledgement, observes the committed target state, and reports schema evolution success without re-applying a conflicting DDL.
+
+This focused MetadataApplier IT complements the full Pipeline E2E: the Pipeline test protects runtime integration, while the replay IT deterministically exercises DDL ambiguity that is difficult to inject at an exact network packet boundary.
+
 ## 6. Data correctness contract
 
 For primary-key tables, target verification should compare a canonical ordered representation, for example:
@@ -261,13 +328,16 @@ Current gate:
 - checkpointed Writer schema-cache restoration after restart;
 - rescale-state conflict detection;
 - versioned writer-state serialization;
+- replay-safe JDBC DDL reconciliation against target metadata;
+- same-name schema conflict detection;
+- ambiguous committed-DDL acknowledgement-loss recovery;
+- transient/permanent DDL retry classification and bounded backoff;
 - Flink client/JobMaster/TaskManager classloader serialization boundary;
 - final distribution-bundle artifact topology.
 
 Next reliability gates:
 
 - explicit JobManager leadership failover;
-- DDL idempotency under ambiguous database/network failures;
 - repeated restart loops and bounded retry behavior;
 - no-primary-key policy tests.
 
