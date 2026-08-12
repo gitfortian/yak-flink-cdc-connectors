@@ -31,10 +31,12 @@ The MVP uses row-wise JDBC writes and provides **at-least-once** delivery. Table
 
 ## Compatibility
 
-| Yak Connector | Flink CDC | Flink | Java | Status |
-|---|---|---|---|---|
-| `0.1.x` | `3.6.x` | `1.20.x` | 11+ | MVP target |
-| planned | `3.6.x` | `2.2.x` | 11+ | compatibility adapter |
+| Yak Connector | Flink CDC release | Maven artifact line | Flink | Java | Status |
+|---|---|---|---|---|---|
+| `0.1.x` | `3.6.x` | `3.6.x-1.20` | `1.20.x` | 11+ | MVP target |
+| planned | `3.6.x` | `3.6.x-2.2` | `2.2.x` | 11+ | compatibility adapter |
+
+The initial build uses `flink-cdc-common:3.6.0-1.20` with Flink `1.20.3`.
 
 See [docs/compatibility.md](docs/compatibility.md).
 
