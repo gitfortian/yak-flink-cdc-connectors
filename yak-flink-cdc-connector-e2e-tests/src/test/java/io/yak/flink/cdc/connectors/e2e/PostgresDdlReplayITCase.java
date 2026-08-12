@@ -9,6 +9,7 @@ import org.apache.flink.cdc.common.event.CreateTableEvent;
 import org.apache.flink.cdc.common.event.DropColumnEvent;
 import org.apache.flink.cdc.common.event.DropTableEvent;
 import org.apache.flink.cdc.common.event.RenameColumnEvent;
+import org.apache.flink.cdc.common.event.SchemaChangeEvent;
 import org.apache.flink.cdc.common.event.TableId;
 import org.apache.flink.cdc.common.schema.Column;
 import org.apache.flink.cdc.common.schema.Schema;
@@ -22,15 +23,24 @@ import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.utility.DockerImageName;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.sql.Connection;
+import java.sql.Driver;
 import java.sql.DriverManager;
+import java.sql.DriverPropertyInfo;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.SQLRecoverableException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Logger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -58,15 +68,7 @@ class PostgresDdlReplayITCase {
     static void beforeAll() throws Exception {
         POSTGRES.start();
         awaitJdbc();
-        applier =
-                new YakJdbcMetadataApplier(
-                        new JdbcSinkConfig(
-                                jdbcUrl(),
-                                "org.postgresql.Driver",
-                                USER,
-                                PASSWORD,
-                                "postgres",
-                                3));
+        applier = standardApplier();
     }
 
     @AfterAll
@@ -121,6 +123,38 @@ class PostgresDdlReplayITCase {
     }
 
     @Test
+    void reconcilesDdlThatCommittedBeforeJdbcAcknowledgementWasLost() throws SQLException {
+        YakJdbcMetadataApplier ambiguousApplier =
+                new YakJdbcMetadataApplier(
+                        new JdbcSinkConfig(
+                                ambiguousJdbcUrl(),
+                                AmbiguousCommitPostgresDriver.class.getName(),
+                                USER,
+                                PASSWORD,
+                                "postgres",
+                                3));
+
+        AmbiguousCommitPostgresDriver.failAfterNextDdlCommit();
+        assertThatCode(
+                        () ->
+                                ambiguousApplier.applySchemaChange(
+                                        new CreateTableEvent(TABLE_ID, initialSchema())))
+                .doesNotThrowAnyException();
+        assertThat(tableExists()).isTrue();
+
+        AmbiguousCommitPostgresDriver.failAfterNextDdlCommit();
+        AddColumnEvent addStatus =
+                new AddColumnEvent(
+                        TABLE_ID,
+                        Collections.singletonList(
+                                AddColumnEvent.last(
+                                        Column.physicalColumn("status", DataTypes.VARCHAR(16)))));
+        assertThatCode(() -> ambiguousApplier.applySchemaChange(addStatus)).doesNotThrowAnyException();
+        assertThat(columnExists("status")).isTrue();
+        assertThat(columnSize("status")).isEqualTo(16);
+    }
+
+    @Test
     void rejectsCreateReplayWhenExistingTableHasDifferentSchema() throws SQLException {
         try (Connection connection = openConnection(); Statement statement = connection.createStatement()) {
             statement.execute(
@@ -158,6 +192,17 @@ class PostgresDdlReplayITCase {
                 .hasMessageContaining("status");
     }
 
+    private static YakJdbcMetadataApplier standardApplier() {
+        return new YakJdbcMetadataApplier(
+                new JdbcSinkConfig(
+                        jdbcUrl(),
+                        "org.postgresql.Driver",
+                        USER,
+                        PASSWORD,
+                        "postgres",
+                        3));
+    }
+
     private static Schema initialSchema() {
         return Schema.newBuilder()
                 .physicalColumn("id", DataTypes.INT().notNull())
@@ -166,7 +211,7 @@ class PostgresDdlReplayITCase {
                 .build();
     }
 
-    private static void applyTwice(org.apache.flink.cdc.common.event.SchemaChangeEvent event) {
+    private static void applyTwice(SchemaChangeEvent event) {
         assertThatCode(() -> applier.applySchemaChange(event)).doesNotThrowAnyException();
         assertThatCode(() -> applier.applySchemaChange(event)).doesNotThrowAnyException();
     }
@@ -239,5 +284,109 @@ class PostgresDdlReplayITCase {
                 + "/"
                 + DATABASE
                 + "?connectTimeout=5&socketTimeout=5";
+    }
+
+    private static String ambiguousJdbcUrl() {
+        return jdbcUrl().replace("jdbc:postgresql:", "jdbc:yak-ambiguous:postgresql:");
+    }
+
+    /**
+     * Test-only JDBC wrapper that executes the real PostgreSQL DDL and then loses its successful
+     * acknowledgement once. This deterministically models the production ambiguity where the
+     * server committed a schema change before the client observed a connection failure.
+     */
+    public static final class AmbiguousCommitPostgresDriver implements Driver {
+        private static final String PREFIX = "jdbc:yak-ambiguous:";
+        private static final AtomicBoolean FAIL_AFTER_DDL_COMMIT = new AtomicBoolean(false);
+
+        static {
+            try {
+                DriverManager.registerDriver(new AmbiguousCommitPostgresDriver());
+            } catch (SQLException e) {
+                throw new ExceptionInInitializerError(e);
+            }
+        }
+
+        static void failAfterNextDdlCommit() {
+            FAIL_AFTER_DDL_COMMIT.set(true);
+        }
+
+        @Override
+        public Connection connect(String url, Properties info) throws SQLException {
+            if (!acceptsURL(url)) {
+                return null;
+            }
+            String delegateUrl = "jdbc:" + url.substring(PREFIX.length());
+            return wrapConnection(DriverManager.getConnection(delegateUrl, info));
+        }
+
+        @Override
+        public boolean acceptsURL(String url) {
+            return url != null && url.startsWith(PREFIX);
+        }
+
+        @Override
+        public DriverPropertyInfo[] getPropertyInfo(String url, Properties info) {
+            return new DriverPropertyInfo[0];
+        }
+
+        @Override
+        public int getMajorVersion() {
+            return 1;
+        }
+
+        @Override
+        public int getMinorVersion() {
+            return 0;
+        }
+
+        @Override
+        public boolean jdbcCompliant() {
+            return false;
+        }
+
+        @Override
+        public Logger getParentLogger() {
+            return Logger.getLogger(AmbiguousCommitPostgresDriver.class.getName());
+        }
+
+        private static Connection wrapConnection(Connection delegate) {
+            return (Connection)
+                    Proxy.newProxyInstance(
+                            AmbiguousCommitPostgresDriver.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, args) -> {
+                                Object result = invoke(delegate, method, args);
+                                if ("createStatement".equals(method.getName())
+                                        && result instanceof Statement) {
+                                    return wrapStatement((Statement) result);
+                                }
+                                return result;
+                            });
+        }
+
+        private static Statement wrapStatement(Statement delegate) {
+            return (Statement)
+                    Proxy.newProxyInstance(
+                            AmbiguousCommitPostgresDriver.class.getClassLoader(),
+                            new Class<?>[] {Statement.class},
+                            (proxy, method, args) -> {
+                                Object result = invoke(delegate, method, args);
+                                if ("executeUpdate".equals(method.getName())
+                                        && FAIL_AFTER_DDL_COMMIT.compareAndSet(true, false)) {
+                                    throw new SQLRecoverableException(
+                                            "simulated lost DDL acknowledgement", "08006");
+                                }
+                                return result;
+                            });
+        }
+
+        private static Object invoke(Object target, Method method, Object[] args) throws Throwable {
+            try {
+                return method.invoke(target, args);
+            } catch (InvocationTargetException failure) {
+                throw failure.getCause();
+            }
+        }
     }
 }
