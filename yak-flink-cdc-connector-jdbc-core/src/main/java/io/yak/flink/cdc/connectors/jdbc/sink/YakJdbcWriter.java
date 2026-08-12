@@ -5,8 +5,10 @@ import io.yak.flink.cdc.connectors.jdbc.dialect.JdbcDialect;
 import io.yak.flink.cdc.connectors.jdbc.dialect.JdbcDialectRegistry;
 import io.yak.flink.cdc.connectors.jdbc.runtime.JdbcConnectionProvider;
 import io.yak.flink.cdc.connectors.jdbc.runtime.JdbcValueConverter;
+import io.yak.flink.cdc.connectors.jdbc.state.YakJdbcWriterState;
 
 import org.apache.flink.api.connector.sink2.SinkWriter;
+import org.apache.flink.api.connector.sink2.StatefulSinkWriter;
 import org.apache.flink.cdc.common.data.RecordData;
 import org.apache.flink.cdc.common.event.CreateTableEvent;
 import org.apache.flink.cdc.common.event.DataChangeEvent;
@@ -22,28 +24,35 @@ import java.io.IOException;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-public final class YakJdbcWriter implements SinkWriter<Event> {
+public final class YakJdbcWriter implements StatefulSinkWriter<Event, YakJdbcWriterState> {
 
     private final JdbcSinkConfig config;
     private final JdbcDialect dialect;
     private final JdbcConnectionProvider connectionProvider;
-    private final Map<TableId, Schema> schemas = new HashMap<>();
+    private final Map<TableId, Schema> schemas;
 
     private transient Connection connection;
 
     public YakJdbcWriter(JdbcSinkConfig config) throws IOException {
+        this(config, Collections.emptyMap());
+    }
+
+    public YakJdbcWriter(JdbcSinkConfig config, Map<TableId, Schema> recoveredSchemas)
+            throws IOException {
         this.config = config;
         this.dialect = JdbcDialectRegistry.discoverRuntime(config.getDialect(), config.getUrl());
         this.connectionProvider = new JdbcConnectionProvider(config);
+        this.schemas = new HashMap<>(recoveredSchemas);
         this.connection = openConnection();
     }
 
     @Override
-    public void write(Event event, Context context) throws IOException {
+    public void write(Event event, SinkWriter.Context context) throws IOException {
         if (event instanceof SchemaChangeEvent) {
             applySchemaEvent((SchemaChangeEvent) event);
             return;
@@ -58,7 +67,7 @@ public final class YakJdbcWriter implements SinkWriter<Event> {
             throw new IOException(
                     "No schema cached for "
                             + change.tableId()
-                            + ". A CreateTableEvent must reach the sink before data events.");
+                            + ". The table schema must arrive before data or be restored from a checkpoint.");
         }
 
         writeDataChange(change, schema);
@@ -77,7 +86,8 @@ public final class YakJdbcWriter implements SinkWriter<Event> {
         Schema current = schemas.get(event.tableId());
         if (current == null) {
             throw new IllegalStateException(
-                    "Cannot apply schema change before CreateTableEvent for " + event.tableId());
+                    "Cannot apply schema change before CreateTableEvent or state recovery for "
+                            + event.tableId());
         }
         schemas.put(event.tableId(), SchemaUtils.applySchemaChangeEvent(current, event));
     }
@@ -172,6 +182,11 @@ public final class YakJdbcWriter implements SinkWriter<Event> {
         } catch (SQLException | RuntimeException e) {
             throw new IOException("Unable to open JDBC connection to " + config.getUrl(), e);
         }
+    }
+
+    @Override
+    public List<YakJdbcWriterState> snapshotState(long checkpointId) {
+        return Collections.singletonList(new YakJdbcWriterState(schemas));
     }
 
     @Override

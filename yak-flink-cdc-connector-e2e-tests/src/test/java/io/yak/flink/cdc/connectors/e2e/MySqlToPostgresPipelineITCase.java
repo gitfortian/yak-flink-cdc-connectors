@@ -182,14 +182,19 @@ class MySqlToPostgresPipelineITCase {
         long checkpointBeforeFailure = latestCompletedCheckpointId();
         awaitCompletedCheckpointAfter(checkpointBeforeFailure + 1);
 
-        // Flink-level recovery: make the target unavailable, produce a new CDC record and require
-        // the sink task to fail. Fixed-delay restart gives the test an observable RESTARTING window.
-        stopPostgresProcess();
-        executeMySql("INSERT INTO customers(id, name, status) VALUES (6, 'Frank', 'active')");
-        awaitJobStatus("Flink restart after target outage", status -> status == JobStatus.RESTARTING);
+        // Flink-level recovery: pause PostgreSQL without destroying the container/network identity,
+        // produce a new CDC record and require the sink task to fail. Keeping the container intact
+        // makes this a deterministic target outage rather than a Docker lifecycle test.
+        pausePostgres();
+        try {
+            executeMySql("INSERT INTO customers(id, name, status) VALUES (6, 'Frank', 'active')");
+            awaitJobStatus(
+                    "Flink restart after target outage", status -> status == JobStatus.RESTARTING);
+        } finally {
+            unpausePostgres();
+        }
 
-        startPostgresProcess();
-        awaitJdbc("PostgreSQL restart", MySqlToPostgresPipelineITCase::openPostgresConnection);
+        awaitJdbc("PostgreSQL recovery", MySqlToPostgresPipelineITCase::openPostgresConnection);
         awaitJobStatus("Flink running after checkpoint recovery", status -> status == JobStatus.RUNNING);
 
         awaitTargetRows(
@@ -320,12 +325,12 @@ class MySqlToPostgresPipelineITCase {
                 .isGreaterThan(0);
     }
 
-    private static void stopPostgresProcess() {
-        POSTGRES.getDockerClient().killContainerCmd(POSTGRES.getContainerId()).exec();
+    private static void pausePostgres() {
+        POSTGRES.getDockerClient().pauseContainerCmd(POSTGRES.getContainerId()).exec();
     }
 
-    private static void startPostgresProcess() {
-        POSTGRES.getDockerClient().startContainerCmd(POSTGRES.getContainerId()).exec();
+    private static void unpausePostgres() {
+        POSTGRES.getDockerClient().unpauseContainerCmd(POSTGRES.getContainerId()).exec();
     }
 
     private static void awaitTargetRows(

@@ -45,6 +45,8 @@ Every production E2E case MUST follow these rules:
 11. **Tests must be deterministic.** Avoid sleeps as synchronization. Poll observable database state, checkpoint files, or Flink job status instead.
 12. **Always clean up containers and checkpoint state.** Tests must not depend on state left by previous runs.
 13. **Never log credentials or row payloads containing secrets.**
+14. **Schema cache recovery is connector-owned.** A recovered JDBC writer must not depend on Flink CDC replaying `CreateTableEvent` before the first post-recovery DML event.
+15. **Ambiguous recovered schemas must fail fast.** Rescaling or restore must never silently choose one of two conflicting schema states for the same table.
 
 ## 3. Classloader and serialization contract
 
@@ -103,17 +105,72 @@ The test must then prove recovery at the Flink runtime level:
 
 1. enable periodic checkpoints and a bounded fixed-delay restart strategy;
 2. wait until at least two newer completed checkpoints are observable after the last verified target state;
-3. stop the PostgreSQL container process without removing the container or its data;
+3. pause the PostgreSQL container so the database becomes unavailable while its container identity, mapped port and data remain intact;
 4. insert a new MySQL CDC row while the target is unavailable;
 5. verify the Flink job enters `RESTARTING`;
-6. restart PostgreSQL and wait for JDBC readiness;
+6. unpause PostgreSQL and wait for JDBC readiness;
 7. verify the Flink job returns to `RUNNING`;
 8. verify the post-checkpoint CDC row reaches PostgreSQL;
 9. verify the complete final target state remains exact and duplicate-free.
 
-This phase validates the interaction of source checkpoint state, at-least-once replay, PK upsert idempotency, sink recreation and Writer schema-cache reconstruction after a real task failure.
+Pausing is deliberate: this phase tests **target unavailability and Flink recovery**, not Docker container recreation or port-remapping behavior.
 
-## 5. Data correctness contract
+This phase validates the interaction of source checkpoint state, at-least-once replay, PK upsert idempotency, sink recreation and Writer schema-cache restoration after a real task failure.
+
+## 5. Schema cache recovery contract
+
+The JDBC writer requires the latest table schema to bind `DataChangeEvent` values correctly. Keeping that schema only in an in-memory `Map<TableId, Schema>` is not production-safe because a TaskManager restart creates a new writer instance.
+
+Production behavior is therefore defined as:
+
+```text
+SchemaChangeEvent
+       │
+       ▼
+Writer schema cache
+       │
+       │ snapshotState(checkpointId)
+       ▼
+YakJdbcWriterState
+       │
+       │ versioned serializer
+       ▼
+Flink checkpoint / savepoint
+       │
+       │ restoreWriter(...)
+       ▼
+Recovered schema cache
+       │
+       ▼
+first post-recovery DataChangeEvent
+```
+
+Required invariants:
+
+- the latest known `TableId -> Schema` map is part of writer checkpoint state;
+- evolved columns present before a completed checkpoint must be present after restore;
+- the first post-recovery DML event must be writable even if no new `CreateTableEvent` has arrived;
+- a dropped table must not remain in recovered cache state after a checkpoint containing its drop event;
+- duplicate identical states from multiple recovered subtasks may be de-duplicated;
+- conflicting states for the same table must fail recovery with a clear error;
+- state serialization must be explicitly versioned;
+- changing the writer-state byte format requires a serializer version/migration decision rather than an implicit incompatible change;
+- state deserialization must respect the Flink task context classloader.
+
+The initial state serializer version is `1` and is scoped to the supported Flink CDC 3.6.x artifact line. Compatibility with a future Flink CDC line must be proven before claiming old checkpoint/savepoint restore compatibility.
+
+Unit tests must cover at least:
+
+- state serializer round-trip;
+- evolved schema preservation;
+- duplicate-state merge after rescaling;
+- conflicting schema rejection;
+- unsupported serializer-version rejection;
+- empty recovery state.
+
+The real E2E must continue to pass checkpoint/restart after schema evolution. Unit tests prove the state representation; E2E proves that it survives the actual Flink runtime/classloader boundary.
+
+## 6. Data correctness contract
 
 For primary-key tables, target verification should compare a canonical ordered representation, for example:
 
@@ -135,7 +192,7 @@ Those checks can pass while UPDATE/DELETE handling, replay, or recovery is wrong
 
 After checkpoint recovery, the assertion must also prove that replay did not introduce duplicate logical rows.
 
-## 6. Checkpoint policy
+## 7. Checkpoint policy
 
 The baseline E2E enables Flink checkpointing with one concurrent checkpoint at a time.
 
@@ -143,7 +200,7 @@ Before failure injection, record the latest completed checkpoint id and wait for
 
 Completed checkpoints are observed through their `_metadata` files in a dedicated temporary checkpoint directory. Do not replace this with a fixed sleep.
 
-## 7. Timeout policy
+## 8. Timeout policy
 
 Default asynchronous convergence timeout: **120 seconds**.
 
@@ -158,7 +215,7 @@ A timeout failure should include:
 
 Do not solve flakes by adding arbitrary `Thread.sleep(...)` calls as synchronization barriers.
 
-## 8. CI policy
+## 9. CI policy
 
 Normal connector build:
 
@@ -176,7 +233,7 @@ mvn -Pe2e -pl yak-flink-cdc-connector-e2e-tests -am verify
 
 GitHub Actions runs this as a dedicated Java 11 job with Docker available. A PR is not production-safe when the E2E job is red, even if compile/unit jobs are green.
 
-## 9. Adding new E2E cases
+## 10. Adding new E2E cases
 
 New cases should be named `*ITCase.java` and answer one concrete production-risk question.
 
@@ -189,7 +246,7 @@ Good examples:
 
 Avoid broad tests that combine unrelated database-specific edge cases and become impossible to diagnose. The baseline MySQL-to-PostgreSQL test intentionally combines only the minimum lifecycle that every production JDBC sink must survive.
 
-## 10. Production gate roadmap
+## 11. Production gate roadmap
 
 Current gate:
 
@@ -201,7 +258,9 @@ Current gate:
 - target outage causing a real Flink task failure;
 - Flink `RESTARTING -> RUNNING` recovery;
 - post-checkpoint CDC replay and exact final-state verification;
-- Writer schema-cache reconstruction after restart;
+- checkpointed Writer schema-cache restoration after restart;
+- rescale-state conflict detection;
+- versioned writer-state serialization;
 - Flink client/JobMaster/TaskManager classloader serialization boundary;
 - final distribution-bundle artifact topology.
 
