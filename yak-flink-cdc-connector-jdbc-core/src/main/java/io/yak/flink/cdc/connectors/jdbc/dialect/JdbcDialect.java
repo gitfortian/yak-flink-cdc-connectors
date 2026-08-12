@@ -6,6 +6,8 @@ import org.apache.flink.cdc.common.schema.Schema;
 import org.apache.flink.cdc.common.types.DataType;
 
 import java.io.Serializable;
+import java.sql.Connection;
+import java.sql.SQLException;
 
 public interface JdbcDialect extends Serializable {
 
@@ -14,6 +16,25 @@ public interface JdbcDialect extends Serializable {
     String quoteIdentifier(String identifier);
 
     String toDatabaseType(DataType type);
+
+    /**
+     * Returns the JDBC catalog used to inspect a Flink CDC table through {@link
+     * java.sql.DatabaseMetaData}. The default mapping treats the TableId namespace as catalog.
+     */
+    default String metadataCatalog(Connection connection, TableId tableId) throws SQLException {
+        return tableId.getNamespace();
+    }
+
+    /**
+     * Returns the JDBC schema used to inspect a Flink CDC table through {@link
+     * java.sql.DatabaseMetaData}. The default mapping treats TableId.schemaName as schema.
+     */
+    default String metadataSchema(Connection connection, TableId tableId) throws SQLException {
+        return tableId.getSchemaName();
+    }
+
+    /** Returns whether target JDBC metadata represents the requested Flink CDC column type. */
+    boolean isColumnTypeCompatible(DataType expectedType, JdbcColumnMetadata actualColumn);
 
     String buildCreateTableStatement(TableId tableId, Schema schema);
 
