@@ -30,3 +30,17 @@ jobs:
             echo "Bundle must not contain Flink/Flink CDC classes"
             exit 1
           fi
+
+  e2e:
+    name: MySQL to PostgreSQL E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 11
+          cache: maven
+      - name: Run production E2E suite
+        run: mvn -B -ntp -Pe2e -pl yak-flink-cdc-connector-e2e-tests -am verify

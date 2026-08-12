@@ -47,16 +47,29 @@ yak-flink-cdc-connectors
 ├── yak-flink-cdc-connector-jdbc-core
 ├── yak-flink-cdc-connector-jdbc-mysql
 ├── yak-flink-cdc-connector-jdbc-postgres
-└── yak-flink-cdc-connector-jdbc
+├── yak-flink-cdc-connector-jdbc
+└── yak-flink-cdc-connector-e2e-tests
 ```
 
 `yak-flink-cdc-connector-jdbc` is the distribution bundle. It packages the Yak JDBC core and dialect plugins into one JAR while deliberately excluding Flink, Flink CDC, and JDBC drivers.
+
+`yak-flink-cdc-connector-e2e-tests` is a production-oriented verification module. It starts real databases with Testcontainers and executes a real Flink CDC Pipeline through the same Factory SPI used by deployment.
 
 ## Build
 
 ```bash
 mvn clean verify
 ```
+
+The default build intentionally skips Docker E2E tests so normal development remains fast.
+
+Run the production E2E suite explicitly:
+
+```bash
+mvn -Pe2e -pl yak-flink-cdc-connector-e2e-tests -am verify
+```
+
+The E2E test specification and contribution rules are documented in [`yak-flink-cdc-connector-e2e-tests/README.md`](yak-flink-cdc-connector-e2e-tests/README.md).
 
 The bundle is generated at:
 
@@ -101,7 +114,8 @@ More examples are under [`examples/`](examples/).
 2. Database dialects are discovered by an internal SPI and can live in separate modules.
 3. The public Flink CDC dependency is isolated in the connector core.
 4. Compatibility is explicit and CI-tested per supported Flink CDC line.
-5. Prefer upstream Apache capabilities when they become stable; keep Yak-specific dialects as extensions.
+5. Production E2E tests must use real Flink CDC Pipeline execution and real databases, not mocks.
+6. Prefer upstream Apache capabilities when they become stable; keep Yak-specific dialects as extensions.
 
 See [docs/architecture.md](docs/architecture.md).
 
