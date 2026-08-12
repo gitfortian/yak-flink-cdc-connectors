@@ -17,6 +17,8 @@ public final class JdbcSinkConfig implements Serializable {
     private final int batchSize;
     private final long flushIntervalMillis;
     private final long maxBatchBytes;
+    private final int statementCacheSize;
+    private final ReplaySafetyMode replaySafetyMode;
 
     public JdbcSinkConfig(
             String url,
@@ -34,7 +36,9 @@ public final class JdbcSinkConfig implements Serializable {
                 maxRetries,
                 JdbcSinkOptions.DEFAULT_BATCH_SIZE,
                 JdbcSinkOptions.DEFAULT_FLUSH_INTERVAL_MILLIS,
-                JdbcSinkOptions.DEFAULT_MAX_BATCH_BYTES);
+                JdbcSinkOptions.DEFAULT_MAX_BATCH_BYTES,
+                JdbcSinkOptions.DEFAULT_STATEMENT_CACHE_SIZE,
+                ReplaySafetyMode.STRICT);
     }
 
     public JdbcSinkConfig(
@@ -55,7 +59,9 @@ public final class JdbcSinkConfig implements Serializable {
                 maxRetries,
                 batchSize,
                 flushIntervalMillis,
-                JdbcSinkOptions.DEFAULT_MAX_BATCH_BYTES);
+                JdbcSinkOptions.DEFAULT_MAX_BATCH_BYTES,
+                JdbcSinkOptions.DEFAULT_STATEMENT_CACHE_SIZE,
+                ReplaySafetyMode.STRICT);
     }
 
     public JdbcSinkConfig(
@@ -68,6 +74,32 @@ public final class JdbcSinkConfig implements Serializable {
             int batchSize,
             long flushIntervalMillis,
             long maxBatchBytes) {
+        this(
+                url,
+                driver,
+                username,
+                password,
+                dialect,
+                maxRetries,
+                batchSize,
+                flushIntervalMillis,
+                maxBatchBytes,
+                JdbcSinkOptions.DEFAULT_STATEMENT_CACHE_SIZE,
+                ReplaySafetyMode.STRICT);
+    }
+
+    public JdbcSinkConfig(
+            String url,
+            String driver,
+            String username,
+            String password,
+            String dialect,
+            int maxRetries,
+            int batchSize,
+            long flushIntervalMillis,
+            long maxBatchBytes,
+            int statementCacheSize,
+            ReplaySafetyMode replaySafetyMode) {
         this.url = Objects.requireNonNull(url, "url");
         this.driver = Objects.requireNonNull(driver, "driver");
         this.username = username == null ? "" : username;
@@ -85,10 +117,15 @@ public final class JdbcSinkConfig implements Serializable {
         if (maxBatchBytes <= 0) {
             throw new IllegalArgumentException("max-batch-bytes must be > 0");
         }
+        if (statementCacheSize <= 0) {
+            throw new IllegalArgumentException("statement-cache-size must be > 0");
+        }
         this.maxRetries = maxRetries;
         this.batchSize = batchSize;
         this.flushIntervalMillis = flushIntervalMillis;
         this.maxBatchBytes = maxBatchBytes;
+        this.statementCacheSize = statementCacheSize;
+        this.replaySafetyMode = Objects.requireNonNull(replaySafetyMode, "replaySafetyMode");
     }
 
     public static JdbcSinkConfig from(Configuration configuration) {
@@ -101,7 +138,9 @@ public final class JdbcSinkConfig implements Serializable {
                 configuration.get(JdbcSinkOptions.MAX_RETRIES),
                 configuration.get(JdbcSinkOptions.BATCH_SIZE),
                 configuration.get(JdbcSinkOptions.FLUSH_INTERVAL_MILLIS),
-                configuration.get(JdbcSinkOptions.MAX_BATCH_BYTES));
+                configuration.get(JdbcSinkOptions.MAX_BATCH_BYTES),
+                configuration.get(JdbcSinkOptions.STATEMENT_CACHE_SIZE),
+                ReplaySafetyMode.fromOption(configuration.get(JdbcSinkOptions.REPLAY_SAFETY)));
     }
 
     public String getUrl() {
@@ -138,5 +177,13 @@ public final class JdbcSinkConfig implements Serializable {
 
     public long getMaxBatchBytes() {
         return maxBatchBytes;
+    }
+
+    public int getStatementCacheSize() {
+        return statementCacheSize;
+    }
+
+    public ReplaySafetyMode getReplaySafetyMode() {
+        return replaySafetyMode;
     }
 }
