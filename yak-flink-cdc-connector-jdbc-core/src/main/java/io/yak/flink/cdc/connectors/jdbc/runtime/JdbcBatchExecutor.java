@@ -23,7 +23,11 @@ public final class JdbcBatchExecutor implements AutoCloseable {
             throws IOException {
         this.config = config;
         this.connectionProvider = connectionProvider;
-        this.connection = openConnection();
+        try {
+            this.connection = openConnection();
+        } catch (SQLException failure) {
+            throw new IOException("Unable to open JDBC batch connection", failure);
+        }
     }
 
     public void execute(JdbcBatchBuffer buffer) throws IOException {
@@ -42,14 +46,31 @@ public final class JdbcBatchExecutor implements AutoCloseable {
                 last = failure;
                 rollbackQuietly();
                 invalidateConnection();
-                if (attempt == config.getMaxRetries()) {
+
+                if (attempt == config.getMaxRetries()
+                        || !JdbcFailureClassifier.isRetryable(failure)) {
                     break;
+                }
+
+                try {
+                    JdbcFailureClassifier.sleepBeforeRetry(attempt);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException(
+                            "Interrupted while retrying JDBC batch flush. bufferedRecords="
+                                    + buffer.size(),
+                            interrupted);
                 }
             }
         }
 
         throw new IOException(
-                "JDBC batch flush failed after retries. bufferedRecords=" + buffer.size(), last);
+                "JDBC batch flush failed. bufferedRecords="
+                        + buffer.size()
+                        + ", estimatedBytes="
+                        + buffer.estimatedBytes()
+                        + failureSummary(last),
+                last);
     }
 
     private void executeSegments(List<JdbcBatchBuffer.BatchSegment> segments) throws SQLException {
@@ -97,21 +118,17 @@ public final class JdbcBatchExecutor implements AutoCloseable {
         return cached;
     }
 
-    private void ensureConnection() throws SQLException, IOException {
+    private void ensureConnection() throws SQLException {
         if (connection == null || connection.isClosed() || !connection.isValid(2)) {
             invalidateConnection();
             connection = openConnection();
         }
     }
 
-    private Connection openConnection() throws IOException {
-        try {
-            Connection opened = connectionProvider.open();
-            opened.setAutoCommit(false);
-            return opened;
-        } catch (SQLException | RuntimeException failure) {
-            throw new IOException("Unable to open JDBC batch connection", failure);
-        }
+    private Connection openConnection() throws SQLException {
+        Connection opened = connectionProvider.open();
+        opened.setAutoCommit(false);
+        return opened;
     }
 
     /** Close cached statements after a schema change so the next write prepares against new metadata. */
@@ -133,7 +150,8 @@ public final class JdbcBatchExecutor implements AutoCloseable {
         try {
             connection.rollback();
         } catch (SQLException ignored) {
-            // The connection may already be broken. The full buffered batch is retried below.
+            // The connection may already be broken. A retry recreates the connection and replays
+            // the full buffered batch under the connector's at-least-once contract.
         }
     }
 
@@ -148,6 +166,16 @@ public final class JdbcBatchExecutor implements AutoCloseable {
                 connection = null;
             }
         }
+    }
+
+    private static String failureSummary(SQLException failure) {
+        if (failure == null) {
+            return "";
+        }
+        return ", sqlState="
+                + failure.getSQLState()
+                + ", errorCode="
+                + failure.getErrorCode();
     }
 
     @Override
