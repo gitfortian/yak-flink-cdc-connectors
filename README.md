@@ -39,7 +39,7 @@ One flush is one JDBC transaction:
 CDC events
    │
    ▼
-ordered in-memory buffer
+ordered bounded in-memory buffer
    │
    ├─ adjacent same SQL ──► one JDBC batch segment
    │
@@ -52,25 +52,41 @@ commit once
 
 The buffer preserves the original event order. Only **adjacent** records using the same SQL are coalesced. The connector never globally groups all upserts/deletes because doing so could reorder a stream such as `UPSERT -> DELETE -> UPSERT` and change the final database state.
 
+### Flush boundaries
+
 A pending batch is flushed when any of these conditions is reached:
 
 - `batch-size` records are buffered;
-- `flush-interval-ms` processing-time timer fires;
+- the estimated retained payload reaches `max-batch-bytes`;
+- `flush-interval-ms` processing time has elapsed since the first currently pending record;
 - Flink calls `SinkWriter.flush(...)` for a checkpoint or end-of-input;
 - Flink CDC sends a `FlushEvent` before schema evolution;
 - the writer closes.
 
+`batch-size` and `max-batch-bytes` are independent safety limits: the first threshold reached triggers the flush. `max-batch-bytes` is a conservative estimate of JVM-retained batch payload, not a database network packet-size setting. This prevents a snapshot containing large `TEXT`, `VARCHAR` or binary values from retaining an unexpectedly large amount of TaskManager heap merely because the record-count limit has not yet been reached.
+
+If a single record is itself larger than `max-batch-bytes`, the connector first flushes any existing batch, accepts that record as the only buffered record and immediately flushes it. Therefore the writer is bounded to the configured batch budget plus at most one unavoidable input record.
+
+Timed flushing is demand-driven. The writer registers a one-shot processing-time timer only after the first pending record enters an empty buffer. A successful flush cancels that timer, so an idle sink does not continuously wake up to perform empty flushes.
+
 Prepared statements are cached across normal flushes. A schema-change boundary flushes pending data and invalidates the statement cache before the writer adopts the new schema.
 
-If a batch fails, the connector rolls back the transaction, recreates the JDBC connection and retries the full ordered batch up to `max-retries`. An ambiguous commit can therefore replay a batch. Primary-key upserts/deletes remain idempotent under the connector's at-least-once contract; append-only tables without a primary key still carry duplicate risk after replay.
+### Failure and retry semantics
+
+A failed batch is rolled back as one JDBC transaction. The connector only retries failures that JDBC or SQLState identifies as transient/recoverable, including connection failures (`08`), transaction rollback/serialization failures (`40`), `SQLTransientException` and `SQLRecoverableException`. Retries use bounded backoff, recreate the connection and replay the complete ordered batch.
+
+Permanent SQL failures such as constraint violations (`23`), syntax errors (`42`), type/data errors (`22`) and permission errors fail fast after rollback; they do **not** consume `max-retries` by repeatedly submitting the same invalid batch.
+
+An ambiguous commit can still replay a batch under the connector's at-least-once contract. Primary-key upserts/deletes remain idempotent under replay; append-only tables without a primary key still carry duplicate risk.
 
 Batch options:
 
 | Option | Default | Meaning |
 |---|---:|---|
 | `batch-size` | `1000` | maximum buffered records before an immediate flush |
-| `flush-interval-ms` | `2000` | processing-time flush interval; `0` disables timed flush |
-| `max-retries` | `3` | maximum retry count after a JDBC batch failure |
+| `max-batch-bytes` | `16777216` (16 MiB) | estimated maximum JVM-retained batch payload before an immediate flush |
+| `flush-interval-ms` | `2000` | maximum age of a non-empty batch; `0` disables timed flush |
+| `max-retries` | `3` | maximum retry count for transient/recoverable JDBC batch failures |
 
 ## Compatibility
 
@@ -141,6 +157,7 @@ sink:
   password: postgres
   dialect: postgres
   batch-size: 1000
+  max-batch-bytes: 16777216
   flush-interval-ms: 2000
 
 pipeline:
@@ -161,8 +178,10 @@ More examples are under [`examples/`](examples/).
 4. Compatibility is explicit and CI-tested per supported Flink CDC line.
 5. Production E2E tests must use real Flink CDC Pipeline execution and real databases, not mocks.
 6. DML batching must preserve CDC event order across tables and operation types.
-7. Schema evolution must flush old-schema DML before DDL and invalidate cached statements afterward.
-8. Prefer upstream Apache capabilities when they become stable; keep Yak-specific dialects as extensions.
+7. Batch buffering must be bounded by both record count and estimated retained payload.
+8. Permanent SQL failures must fail fast after rollback; only transient/recoverable failures may consume retries.
+9. Schema evolution must flush old-schema DML before DDL and invalidate cached statements afterward.
+10. Prefer upstream Apache capabilities when they become stable; keep Yak-specific dialects as extensions.
 
 See [docs/architecture.md](docs/architecture.md).
 
