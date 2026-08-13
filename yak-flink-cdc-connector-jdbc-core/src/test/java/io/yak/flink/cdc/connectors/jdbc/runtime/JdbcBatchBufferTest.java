@@ -1,5 +1,6 @@
 package io.yak.flink.cdc.connectors.jdbc.runtime;
 
+import org.apache.flink.cdc.common.event.TableId;
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
@@ -26,6 +27,20 @@ class JdbcBatchBufferTest {
         assertThat(buffer.getSegments().get(1).size()).isEqualTo(1);
         assertThat(buffer.getSegments().get(2).getSql()).isEqualTo("UPSERT");
         assertThat(buffer.getSegments().get(2).size()).isEqualTo(1);
+    }
+
+    @Test
+    void sameSqlOnDifferentTablesRemainsSeparateForStatementScoping() {
+        JdbcBatchBuffer buffer = new JdbcBatchBuffer();
+        TableId first = TableId.tableId("app", "first_table");
+        TableId second = TableId.tableId("app", "second_table");
+
+        buffer.add(first, "UPSERT", Collections.singletonList(1));
+        buffer.add(second, "UPSERT", Collections.singletonList(2));
+
+        assertThat(buffer.getSegments()).hasSize(2);
+        assertThat(buffer.getSegments().get(0).getTableId()).isEqualTo(first);
+        assertThat(buffer.getSegments().get(1).getTableId()).isEqualTo(second);
     }
 
     @Test

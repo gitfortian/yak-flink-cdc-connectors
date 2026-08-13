@@ -1,5 +1,7 @@
 package io.yak.flink.cdc.connectors.jdbc.runtime;
 
+import org.apache.flink.cdc.common.event.TableId;
+
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -10,9 +12,10 @@ import java.util.Objects;
 /**
  * Ordered in-memory JDBC batch buffer.
  *
- * <p>Only adjacent records with the same SQL statement are coalesced into one JDBC batch segment.
- * This deliberately preserves the original CDC event order. Globally grouping identical SQL could
- * reorder a stream such as UPSERT -> DELETE -> UPSERT and produce a different final database state.
+ * <p>Only adjacent records with the same table and SQL statement are coalesced into one JDBC batch
+ * segment. This deliberately preserves the original CDC event order. Globally grouping identical
+ * SQL could reorder a stream such as UPSERT -> DELETE -> UPSERT and produce a different final
+ * database state.
  *
  * <p>The byte accounting is an intentionally conservative JVM-retained-memory estimate. It is used
  * to bound how much payload a writer keeps alive between flushes; it is not a database wire-packet
@@ -27,16 +30,21 @@ public final class JdbcBatchBuffer {
     private int recordCount;
     private long estimatedBytes;
 
+    /** Backward-compatible helper for tests/direct runtime use without table-scoped invalidation. */
     public void add(String sql, List<Object> values) {
+        add(null, sql, values);
+    }
+
+    public void add(TableId tableId, String sql, List<Object> values) {
         Objects.requireNonNull(sql, "sql");
         Objects.requireNonNull(values, "values");
 
         BatchSegment segment =
                 segments.isEmpty() ? null : segments.get(segments.size() - 1);
-        if (segment == null || !segment.getSql().equals(sql)) {
-            segment = new BatchSegment(sql);
+        if (segment == null || !segment.matches(tableId, sql)) {
+            segment = new BatchSegment(tableId, sql);
             segments.add(segment);
-            estimatedBytes += estimateSegmentBytes(sql);
+            estimatedBytes += estimateSegmentBytes(tableId, sql);
         }
         segment.add(values);
         recordCount++;
@@ -55,6 +63,10 @@ public final class JdbcBatchBuffer {
         return recordCount == 0;
     }
 
+    public boolean wouldExceed(long maxBytes, String sql, List<Object> values) {
+        return wouldExceed(maxBytes, null, sql, values);
+    }
+
     /**
      * Returns whether retaining the next record would cross the configured memory boundary.
      *
@@ -62,11 +74,12 @@ public final class JdbcBatchBuffer {
      * before adding it and then flush that oversized record immediately after adding it. That keeps
      * memory bounded to the configured threshold plus at most one unavoidable input record.
      */
-    public boolean wouldExceed(long maxBytes, String sql, List<Object> values) {
+    public boolean wouldExceed(
+            long maxBytes, TableId tableId, String sql, List<Object> values) {
         if (maxBytes <= 0) {
             throw new IllegalArgumentException("maxBytes must be > 0");
         }
-        return estimatedBytes + estimateAdditionalBytes(sql, values) > maxBytes;
+        return estimatedBytes + estimateAdditionalBytes(tableId, sql, values) > maxBytes;
     }
 
     public List<BatchSegment> getSegments() {
@@ -79,20 +92,21 @@ public final class JdbcBatchBuffer {
         estimatedBytes = 0L;
     }
 
-    private long estimateAdditionalBytes(String sql, List<Object> values) {
+    private long estimateAdditionalBytes(TableId tableId, String sql, List<Object> values) {
         Objects.requireNonNull(sql, "sql");
         Objects.requireNonNull(values, "values");
         long additional = estimateRowBytes(values);
         BatchSegment current =
                 segments.isEmpty() ? null : segments.get(segments.size() - 1);
-        if (current == null || !current.getSql().equals(sql)) {
-            additional += estimateSegmentBytes(sql);
+        if (current == null || !current.matches(tableId, sql)) {
+            additional += estimateSegmentBytes(tableId, sql);
         }
         return additional;
     }
 
-    private static long estimateSegmentBytes(String sql) {
-        return SEGMENT_OVERHEAD_BYTES + 2L * sql.length();
+    private static long estimateSegmentBytes(TableId tableId, String sql) {
+        long tableBytes = tableId == null ? 0L : 2L * tableId.identifier().length();
+        return SEGMENT_OVERHEAD_BYTES + tableBytes + 2L * sql.length();
     }
 
     private static long estimateRowBytes(List<Object> values) {
@@ -111,8 +125,6 @@ public final class JdbcBatchBuffer {
             return 16L + ((byte[]) value).length;
         }
         if (value instanceof CharSequence) {
-            // Two bytes per UTF-16 code unit is a safe, allocation-free upper bound for the
-            // character payload retained by the batch.
             return 40L + 2L * ((CharSequence) value).length();
         }
         if (value instanceof BigDecimal) {
@@ -128,15 +140,25 @@ public final class JdbcBatchBuffer {
     }
 
     public static final class BatchSegment {
+        private final TableId tableId;
         private final String sql;
         private final List<List<Object>> rows = new ArrayList<>();
 
-        private BatchSegment(String sql) {
+        private BatchSegment(TableId tableId, String sql) {
+            this.tableId = tableId;
             this.sql = sql;
+        }
+
+        private boolean matches(TableId candidateTableId, String candidateSql) {
+            return Objects.equals(tableId, candidateTableId) && sql.equals(candidateSql);
         }
 
         private void add(List<Object> values) {
             rows.add(Collections.unmodifiableList(new ArrayList<>(values)));
+        }
+
+        public TableId getTableId() {
+            return tableId;
         }
 
         public String getSql() {
