@@ -131,7 +131,8 @@ Batch and safety options:
 | `0.1.x` | `3.6.x` | `3.6.x-1.20` | `1.20.x` | 11+ | MVP target |
 | planned | `3.6.x` | `3.6.x-2.2` | `2.2.x` | 11+ | compatibility adapter |
 
-The initial build uses `flink-cdc-common:3.6.0-1.20` with Flink `1.20.3`.
+The certified Phase 0 baseline is fixed to Java 11, Flink `1.20.5`, and Flink CDC
+`3.6.0-1.20`. Newer Java or patch versions are not implied by this certification.
 
 See [docs/compatibility.md](docs/compatibility.md).
 
@@ -173,6 +174,9 @@ yak-flink-cdc-connector-jdbc/target/yak-flink-cdc-connector-jdbc-0.1.0-SNAPSHOT.
 ```
 
 Put the bundle JAR and the target database JDBC driver JAR into the Flink CDC `lib` directory.
+The Connector bundle deliberately contains neither Flink/Flink CDC nor database drivers. The
+separate [`yak-cdc-runtime`](yak-cdc-runtime/README.md) image assembles those fixed runtime
+dependencies and exposes the small, allow-listed operations gateway used by future Yak Ops work.
 
 ## Example: MySQL CDC -> PostgreSQL
 

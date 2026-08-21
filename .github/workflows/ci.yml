@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        java: [11, 17]
+        java: [11]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-java@v5
@@ -32,7 +32,7 @@ jobs:
           fi
 
   e2e:
-    name: MySQL to PostgreSQL E2E
+    name: MySQL sink E2E matrix
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -44,3 +44,14 @@ jobs:
           cache: maven
       - name: Run production E2E suite
         run: mvn -B -ntp -Pe2e -pl yak-flink-cdc-connector-e2e-tests -am verify
+
+  runtime-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build connector
+        run: mvn -B -ntp -DskipTests package
+      - name: Check connector isolation
+        run: ./scripts/check-connector-isolation.sh
+      - name: Build and smoke runtime
+        run: yak-cdc-runtime/scripts/smoke-test.sh
