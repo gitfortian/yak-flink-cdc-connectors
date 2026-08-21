@@ -1,0 +1,18 @@
+{
+  "runtimeVersion": "0.1.0-phase0",
+  "javaVersion": "11",
+  "flinkVersion": "1.20.5",
+  "flinkCdcVersion": "3.6.0",
+  "flinkCdcArtifactLine": "3.6.0-1.20",
+  "build": {
+    "reproducibility": "versions and base image are pinned; release archives are SHA-512 verified",
+    "connectorArtifact": "yak-flink-cdc-connector-jdbc-0.1.0-SNAPSHOT.jar"
+  },
+  "connectors": {
+    "sources": ["mysql"],
+    "sinks": ["yak-jdbc:mysql", "yak-jdbc:postgres"],
+    "schemaEvolution": ["create-table", "add-column", "rename-column", "drop-column", "alter-column-type", "truncate-table", "drop-table"]
+  },
+  "deliverySemantics": "at-least-once",
+  "credentials": "environment references only; never included in manifests, persisted definitions, or logs"
+}

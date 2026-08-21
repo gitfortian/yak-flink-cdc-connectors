@@ -6,7 +6,11 @@ The purpose is not to test isolated SQL builders. The purpose is to prove that a
 
 ## 1. Test topology
 
-The baseline production gate is:
+The baseline production gates are MySQL -> PostgreSQL and MySQL -> MySQL. The former exercises
+checkpoint/restart, connection recovery, DDL replay, and full schema-cache recovery; the latter is
+a real Pipeline/Factory-SPI sink test covering snapshot, incremental DML, ordered batching, and DDL.
+
+The cross-database topology is:
 
 ```text
 MySQL 8

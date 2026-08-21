@@ -56,16 +56,22 @@ Dialect factories are discovered with Java `ServiceLoader`.
 
 ## Delivery semantics
 
-The MVP uses synchronous row-wise JDBC writes:
+The MVP uses bounded, ordered JDBC batches. A flush is one transaction; adjacent operations with
+the same table and SQL use `addBatch`/`executeBatch`, while cross-table and operation ordering is
+preserved:
 
 - primary-key table: `INSERT` / `UPDATE` / `REPLACE` -> database-native upsert
 - primary-key table: `DELETE` -> delete by primary key
-- no-primary-key table: inserts are allowed
+- no-primary-key table: inserts are rejected by default and require the explicit
+  `replay-safety=allow-append-only` risk opt-in
 - no-primary-key table: update/delete fail fast because replay-safe semantics cannot be guaranteed
 
 This provides at-least-once delivery. Primary-key upserts make common CDC replays idempotent.
 
-Future milestones can add batching and checkpoint-aware 2PC without changing the dialect SPI.
+This is **at-least-once**, not exactly-once. Checkpoints restore source position and the writer's
+schema cache, but JDBC commits are not coordinated with Flink checkpoints by 2PC. A lost commit
+acknowledgement may replay a complete batch. Primary-key upsert/delete converges; opt-in append-only
+rows can duplicate.
 
 ## Schema evolution
 

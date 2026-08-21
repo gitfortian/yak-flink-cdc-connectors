@@ -8,13 +8,13 @@ Yak connectors therefore use an explicit compatibility matrix instead of claimin
 
 | Yak Connector | Flink CDC release | Maven artifact line | Flink | Java |
 |---|---|---|---|---|
-| `0.1.x` | `3.6.x` | `3.6.x-1.20` | `1.20.x` | 11+ |
+| `0.1.x` | `3.6.0` | `3.6.0-1.20` | `1.20.5` | 11 |
 
 The initial build pins:
 
 - Flink CDC release `3.6.0`
 - Flink CDC Maven artifacts `3.6.0-1.20`
-- Flink `1.20.3`
+- Flink `1.20.5`
 
 Flink CDC 3.6 publishes runtime-facing artifacts with the Flink major version suffix, so the release version and Maven artifact version are deliberately tracked separately.
 
